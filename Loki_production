@@ -1,0 +1,3759 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Loki Core Trading System - Improved Version (loki_f1.py)
+Date: 2025-08-13 (Asia/Kolkata)
+
+IMPROVEMENTS IMPLEMENTED:
+- Enhanced error handling with specific exception types and proper logging
+- Improved type safety with proper type hints throughout
+- Better memory management for historical data and caching
+- Thread-safe operations and proper asyncio/threading separation
+- Optimized DataFrame operations with chunking and efficient indexing
+- Enhanced circuit breakers and retry mechanisms
+- Proper resource cleanup and context managers
+- Comprehensive configuration validation
+- Structured logging with correlation IDs
+- Performance monitoring and metrics collection
+"""
+
+from __future__ import annotations
+
+# =============== Standard Library Imports ===============
+import os
+import sys
+import gc
+import csv
+import ssl
+import math
+import json
+import time
+import uuid
+import glob
+import queue
+import errno
+import atexit
+import base64
+import random
+import sqlite3
+import logging
+import threading
+import traceback
+import functools
+import itertools
+import statistics as stats
+import weakref
+from dataclasses import dataclass, field, asdict
+from typing import (
+    Any, Dict, List, Optional, Tuple, Callable, Union, Protocol, 
+    TypeVar, Generic, Iterator, AsyncIterator, NamedTuple, Literal
+)
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from contextlib import asynccontextmanager, contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict, deque
+import asyncio
+from asyncio import Semaphore, Lock as AsyncLock
+
+# =============== Custom Exception Classes ===============
+class LokiException(Exception):
+    """Base exception for Loki trading system"""
+    pass
+
+class ConfigurationError(LokiException):
+    """Configuration validation errors"""
+    pass
+
+class ExchangeError(LokiException):
+    """Exchange connection and API errors"""
+    pass
+
+class RiskManagementError(LokiException):
+    """Risk management constraint violations"""
+    pass
+
+class ModelError(LokiException):
+    """Model loading and inference errors"""
+    pass
+
+class DataValidationError(LokiException):
+    """Data validation and integrity errors"""
+    pass
+
+# =============== Optional Third-Party Imports (Graceful Degrade) ===============
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    np = None
+    HAS_NUMPY = False
+
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    pd = None
+    HAS_PANDAS = False
+
+try:
+    import ccxt.async_support as ccxt_async
+    HAS_CCXT = True
+except ImportError:
+    ccxt_async = None
+    HAS_CCXT = False
+
+try:
+    from cryptography.fernet import Fernet
+    HAS_CRYPTO = True
+except ImportError:
+    Fernet = None
+    HAS_CRYPTO = False
+
+# =============== Type Aliases ===============
+T = TypeVar('T')
+ConfigDict = Dict[str, Any]
+PositionDict = Dict[str, Dict[str, float]]
+PriceDict = Dict[str, float]
+ModelDict = Dict[str, Any]
+
+# =============== Protocol Definitions ===============
+class ModelProtocol(Protocol):
+    def predict(self, features: np.ndarray) -> Union[np.ndarray, List[float]]:
+        ...
+
+class ExchangeProtocol(Protocol):
+    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> Optional['pd.DataFrame']:
+        ...
+    
+    async def get_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
+        ...
+
+# =============== Constants & Paths ===============
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+MODELS_DIR = APP_DIR / "models"
+LOGS_DIR = APP_DIR / "logs"
+REPORTS_DIR = APP_DIR / "reports"
+DB_PATH = DATA_DIR / "loki.sqlite3"
+MODELS_REGISTRY = APP_DIR / "models.json"
+FERNET_KEY_FILE = DATA_DIR / ".fernet.key"
+CONFIG_FILE = APP_DIR / "config.json"
+
+# Create directories
+for directory in (DATA_DIR, MODELS_DIR, LOGS_DIR, REPORTS_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+
+# =============== Enhanced Logging with Correlation IDs ===============
+class CorrelationIDFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, 'correlation_id'):
+            record.correlation_id = getattr(threading.current_thread(), 'correlation_id', 'MAIN')
+        return True
+
+def setup_logging() -> logging.Logger:
+    """Setup structured logging with correlation IDs"""
+    log_level = os.getenv("LOKI_LOG_LEVEL", "INFO").upper()
+    
+    logger = logging.getLogger("loki")
+    logger.setLevel(log_level)
+    
+    # Clear existing handlers
+    logger.handlers.clear()
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(log_level)
+    
+    # File handler with rotation
+    file_handler = logging.FileHandler(LOGS_DIR / "loki.log", encoding="utf-8")
+    file_handler.setLevel(log_level)
+    
+    # Formatter with correlation ID
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(correlation_id)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    
+    # Add correlation ID filter
+    correlation_filter = CorrelationIDFilter()
+    
+    for handler in [console_handler, file_handler]:
+        handler.setFormatter(formatter)
+        handler.addFilter(correlation_filter)
+        logger.addHandler(handler)
+    
+    return logger
+
+logger = setup_logging()
+
+def set_correlation_id(correlation_id: str) -> None:
+    """Set correlation ID for current thread"""
+    threading.current_thread().correlation_id = correlation_id
+
+def log_with_context(level: str, msg: str, **ctx: Any) -> None:
+    """Log with structured context"""
+    log_func = getattr(logger, level.lower(), logger.info)
+    if ctx:
+        log_func("%s | ctx=%s", msg, json.dumps(ctx, default=str))
+    else:
+        log_func(msg)
+
+def log_exception(msg: str, exc: Optional[Exception] = None, **ctx: Any) -> None:
+    """Log exception with context"""
+    if exc:
+        ctx['exception_type'] = type(exc).__name__
+        ctx['exception_msg'] = str(exc)
+    
+    logger.error("%s | ctx=%s\n%s", msg, json.dumps(ctx, default=str), traceback.format_exc())
+
+# =============== Utility Functions ===============
+def utcnow() -> datetime:
+    """Get current UTC datetime"""
+    return datetime.now(timezone.utc)
+
+def utc_timestamp() -> float:
+    """Get current UTC timestamp"""
+    return utcnow().timestamp()
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    """Safely convert value to float"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def safe_int(value: Any, default: int = 0) -> int:
+    """Safely convert value to int"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def clamp(value: float, min_val: float, max_val: float) -> float:
+    """Clamp value between min and max"""
+    return max(min_val, min(max_val, value))
+
+def human_datetime(timestamp: Optional[float] = None) -> str:
+    """Convert timestamp to human readable datetime"""
+    ts = timestamp or time.time()
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+# =============== Enhanced Circuit Breaker ===============
+@dataclass
+class CircuitBreakerState:
+    """Circuit breaker state tracking"""
+    fail_count: int = 0
+    state: Literal["CLOSED", "OPEN", "HALF_OPEN"] = "CLOSED"
+    last_failure_time: float = 0.0
+    last_success_time: float = 0.0
+
+class CircuitBreaker:
+    """Enhanced circuit breaker with exponential backoff"""
+    
+    def __init__(
+        self, 
+        failure_threshold: int = 5, 
+        reset_timeout: float = 30.0,
+        half_open_max_calls: int = 3
+    ):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.half_open_max_calls = half_open_max_calls
+        self._state = CircuitBreakerState()
+        self._lock = threading.Lock()
+        self._half_open_calls = 0
+    
+    def can_execute(self) -> bool:
+        """Check if execution is allowed"""
+        with self._lock:
+            current_time = time.time()
+            
+            if self._state.state == "CLOSED":
+                return True
+            elif self._state.state == "OPEN":
+                if current_time - self._state.last_failure_time >= self.reset_timeout:
+                    self._state.state = "HALF_OPEN"
+                    self._half_open_calls = 0
+                    return True
+                return False
+            elif self._state.state == "HALF_OPEN":
+                return self._half_open_calls < self.half_open_max_calls
+            
+            return False
+    
+    def record_success(self) -> None:
+        """Record successful execution"""
+        with self._lock:
+            self._state.fail_count = 0
+            self._state.last_success_time = time.time()
+            if self._state.state == "HALF_OPEN":
+                self._state.state = "CLOSED"
+                self._half_open_calls = 0
+            elif self._state.state == "OPEN":
+                self._state.state = "CLOSED"
+    
+    def record_failure(self) -> None:
+        """Record failed execution"""
+        with self._lock:
+            self._state.fail_count += 1
+            self._state.last_failure_time = time.time()
+            
+            if self._state.state == "HALF_OPEN":
+                self._half_open_calls += 1
+                if self._half_open_calls >= self.half_open_max_calls:
+                    self._state.state = "OPEN"
+            elif self._state.fail_count >= self.failure_threshold:
+                self._state.state = "OPEN"
+    
+    @property
+    def state(self) -> str:
+        """Get current circuit breaker state"""
+        return self._state.state
+
+# =============== Enhanced Retry Decorator ===============
+def retry_async(
+    max_attempts: int = 3,
+    base_delay: float = 0.5,
+    max_delay: float = 30.0,
+    exponential_base: float = 2.0,
+    jitter: bool = True,
+    exceptions: Tuple[type, ...] = (Exception,)
+):
+    """Enhanced async retry decorator with exponential backoff"""
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception = None
+            
+            for attempt in range(max_attempts):
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as e:
+                    last_exception = e
+                    
+                    if attempt == max_attempts - 1:
+                        break
+                    
+                    # Calculate delay with exponential backoff
+                    delay = min(base_delay * (exponential_base ** attempt), max_delay)
+                    
+                    # Add jitter to prevent thundering herd
+                    if jitter:
+                        delay *= (0.5 + random.random() * 0.5)
+                    
+                    log_with_context(
+                        "warning", 
+                        f"Attempt {attempt + 1} failed, retrying in {delay:.2f}s",
+                        function=func.__name__,
+                        exception=str(e)
+                    )
+                    
+                    await asyncio.sleep(delay)
+            
+            raise last_exception
+        
+        return wrapper
+    return decorator
+
+# =============== Memory-Efficient Data Manager ===============
+class MemoryEfficientDataFrame:
+    """Memory-efficient DataFrame wrapper with automatic cleanup"""
+    
+    def __init__(self, df: 'pd.DataFrame', max_size: int = 1000):
+        self.max_size = max_size
+        self._df = df.tail(max_size) if len(df) > max_size else df.copy()
+        self._last_accessed = time.time()
+    
+    @property
+    def df(self) -> 'pd.DataFrame':
+        """Get DataFrame with access tracking"""
+        self._last_accessed = time.time()
+        return self._df
+    
+    def append_row(self, row: Dict[str, Any]) -> None:
+        """Append row with automatic size management"""
+        if not HAS_PANDAS:
+            return
+            
+        new_row = pd.DataFrame([row], index=[row.get('timestamp', pd.Timestamp.now())])
+        self._df = pd.concat([self._df, new_row]).tail(self.max_size)
+        self._last_accessed = time.time()
+    
+    def is_stale(self, max_age_seconds: float = 3600) -> bool:
+        """Check if data is stale"""
+        return time.time() - self._last_accessed > max_age_seconds
+    
+    def memory_usage(self) -> int:
+        """Get memory usage in bytes"""
+        if not HAS_PANDAS:
+            return 0
+        return self._df.memory_usage(deep=True).sum()
+
+class DataManager:
+    """Thread-safe data manager with memory optimization"""
+    
+    def __init__(self, max_symbols: int = 100, max_rows_per_symbol: int = 1000):
+        self.max_symbols = max_symbols
+        self.max_rows_per_symbol = max_rows_per_symbol
+        self._data: Dict[str, MemoryEfficientDataFrame] = {}
+        self._lock = threading.RLock()
+        self._cleanup_interval = 3600  # 1 hour
+        self._last_cleanup = time.time()
+    
+    def store_ohlcv(self, symbol: str, timeframe: str, df: 'pd.DataFrame') -> None:
+        """Store OHLCV data with memory management"""
+        if not HAS_PANDAS or df is None or df.empty:
+            return
+        
+        key = f"{symbol}_{timeframe}"
+        
+        with self._lock:
+            # Cleanup if needed
+            self._cleanup_if_needed()
+            
+            # Manage symbol limit
+            if key not in self._data and len(self._data) >= self.max_symbols:
+                # Remove oldest accessed data
+                oldest_key = min(
+                    self._data.keys(), 
+                    key=lambda k: self._data[k]._last_accessed
+                )
+                del self._data[oldest_key]
+                gc.collect()
+            
+            # Store or update data
+            if key in self._data:
+                # Append new data if it's newer
+                existing_df = self._data[key].df
+                if not existing_df.empty:
+                    last_timestamp = existing_df.index[-1]
+                    new_data = df[df.index > last_timestamp]
+                    if not new_data.empty:
+                        for _, row in new_data.iterrows():
+                            self._data[key].append_row(row.to_dict())
+                else:
+                    self._data[key] = MemoryEfficientDataFrame(df, self.max_rows_per_symbol)
+            else:
+                self._data[key] = MemoryEfficientDataFrame(df, self.max_rows_per_symbol)
+    
+    def get_ohlcv(self, symbol: str, timeframe: str) -> Optional['pd.DataFrame']:
+        """Get OHLCV data"""
+        key = f"{symbol}_{timeframe}"
+        
+        with self._lock:
+            if key in self._data:
+                return self._data[key].df.copy()
+            return None
+    
+    def _cleanup_if_needed(self) -> None:
+        """Cleanup stale data if needed"""
+        current_time = time.time()
+        if current_time - self._last_cleanup < self._cleanup_interval:
+            return
+        
+        stale_keys = [
+            key for key, data in self._data.items() 
+            if data.is_stale()
+        ]
+        
+        for key in stale_keys:
+            del self._data[key]
+        
+        if stale_keys:
+            gc.collect()
+            log_with_context("info", f"Cleaned up {len(stale_keys)} stale datasets")
+        
+        self._last_cleanup = current_time
+    
+    def get_memory_usage(self) -> Dict[str, int]:
+        """Get memory usage statistics"""
+        with self._lock:
+            return {
+                key: data.memory_usage() 
+                for key, data in self._data.items()
+            }
+    
+    def clear(self) -> None:
+        """Clear all data"""
+        with self._lock:
+            self._data.clear()
+            gc.collect()
+
+# =============== Enhanced Configuration Management ===============
+DEFAULT_CONFIG: ConfigDict = {
+    "paper": True,
+    "exchange": "binance",
+    "assets": ["BTC/USDT"],
+    "timeframes": ["1h", "4h", "1d"],
+    "poll_interval": 5.0,
+    "risk": {
+        "max_drawdown_pct": 0.50,
+        "daily_loss_limit_pct": 0.10,
+        "profit_anchor_pct": 0.10,
+        "stop_loss_pct": 0.02,
+        "trailing_stop_pct": 0.015,
+        "max_single_pos_pct": 0.15,
+        "max_portfolio_exposure_pct": 0.80,
+        "var_window": 200,
+        "var_quantile": 0.99
+    },
+    "positioning": {
+        "atr_period": 14,
+        "atr_risk_mult": 1.0,
+        "vol_regimes": [0.5, 1.5],
+        "correlation_limit": 0.85
+    },
+    "signals": {
+        "rsi_period": 14,
+        "rsi_buy": 30,
+        "rsi_sell": 70,
+        "bb_period": 20,
+        "bb_mult": 2.0,
+        "ema_smooth": 5,
+        "adx_period": 14,
+        "stoch_k": 14,
+        "stoch_d": 3
+    },
+    "weights": {
+        "ta": 0.6,
+        "ml": 0.3,
+        "llm": 0.1
+    },
+    "alerts": {
+        "email": False,
+        "slack": False
+    },
+    "performance": {
+        "max_concurrent_requests": 8,
+        "request_timeout": 30.0,
+        "max_memory_mb": 1024,
+        "cleanup_interval": 3600
+    }
+}
+
+class ConfigValidator:
+    """Enhanced configuration validator"""
+    
+    @staticmethod
+    def validate_numeric_range(
+        value: Any, 
+        min_val: float, 
+        max_val: float, 
+        field_name: str
+    ) -> float:
+        """Validate numeric value is within range"""
+        try:
+            num_val = float(value)
+            if not (min_val <= num_val <= max_val):
+                raise ConfigurationError(
+                    f"{field_name} must be between {min_val} and {max_val}, got {num_val}"
+                )
+            return num_val
+        except (TypeError, ValueError) as e:
+            raise ConfigurationError(f"{field_name} must be a valid number: {e}")
+    
+    @staticmethod
+    def validate_config(config: ConfigDict) -> None:
+        """Comprehensive configuration validation"""
+        # Validate signal parameters
+        signals = config.get("signals", {})
+        
+        ConfigValidator.validate_numeric_range(
+            signals.get("rsi_period", 14), 1, 100, "signals.rsi_period"
+        )
+        ConfigValidator.validate_numeric_range(
+            signals.get("bb_period", 20), 1, 300, "signals.bb_period"
+        )
+        
+        rsi_buy = ConfigValidator.validate_numeric_range(
+            signals.get("rsi_buy", 30), 0, 100, "signals.rsi_buy"
+        )
+        rsi_sell = ConfigValidator.validate_numeric_range(
+            signals.get("rsi_sell", 70), 0, 100, "signals.rsi_sell"
+        )
+        
+        if rsi_buy >= rsi_sell:
+            raise ConfigurationError("signals.rsi_buy must be less than signals.rsi_sell")
+        
+        # Validate risk parameters
+        risk = config.get("risk", {})
+        for key in ["max_drawdown_pct", "daily_loss_limit_pct", "profit_anchor_pct",
+                   "stop_loss_pct", "trailing_stop_pct", "max_single_pos_pct", 
+                   "max_portfolio_exposure_pct"]:
+            ConfigValidator.validate_numeric_range(
+                risk.get(key, 0.0), 0.0, 1.0, f"risk.{key}"
+            )
+        
+        # Validate positioning parameters
+        positioning = config.get("positioning", {})
+        ConfigValidator.validate_numeric_range(
+            positioning.get("correlation_limit", 0.85), -1.0, 1.0, 
+            "positioning.correlation_limit"
+        )
+        
+        # Validate assets format
+        assets = config.get("assets", [])
+        if not assets:
+            raise ConfigurationError("At least one asset must be specified")
+        
+        for asset in assets:
+            if not isinstance(asset, str) or "/" not in asset:
+                raise ConfigurationError(f"Invalid asset format: {asset}. Expected format: 'BASE/QUOTE'")
+        
+        # Validate poll interval
+        ConfigValidator.validate_numeric_range(
+            config.get("poll_interval", 5.0), 1.0, 3600.0, "poll_interval"
+        )
+        
+        # Validate performance parameters
+        performance = config.get("performance", {})
+        ConfigValidator.validate_numeric_range(
+            performance.get("max_concurrent_requests", 8), 1, 128, 
+            "performance.max_concurrent_requests"
+        )
+
+def load_config() -> ConfigDict:
+    """Load and validate configuration"""
+    try:
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            
+            # Merge with defaults for missing keys
+            def merge_configs(default: Dict, user: Dict) -> Dict:
+                result = default.copy()
+                for key, value in user.items():
+                    if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                        result[key] = merge_configs(result[key], value)
+                    else:
+                        result[key] = value
+                return result
+            
+            config = merge_configs(DEFAULT_CONFIG, config)
+        else:
+            config = DEFAULT_CONFIG.copy()
+            save_config(config)
+            log_with_context("info", "Created default configuration file")
+        
+        ConfigValidator.validate_config(config)
+        return config
+        
+    except json.JSONDecodeError as e:
+        raise ConfigurationError(f"Invalid JSON in config file: {e}")
+    except Exception as e:
+        log_exception("Failed to load configuration", e)
+        return DEFAULT_CONFIG.copy()
+
+def save_config(config: ConfigDict) -> None:
+    """Save configuration to file"""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2)
+    except Exception as e:
+        log_exception("Failed to save configuration", e)
+
+# =============== Enhanced Database Layer ===============
+class DatabaseManager:
+    """Thread-safe database manager with connection pooling"""
+    
+    def __init__(self, db_path: Path, max_connections: int = 5):
+        self.db_path = db_path
+        self.max_connections = max_connections
+        self._connections: queue.Queue = queue.Queue(maxsize=max_connections)
+        self._lock = threading.Lock()
+        self._initialized = False
+    
+    def _create_connection(self) -> sqlite3.Connection:
+        """Create a new database connection"""
+        conn = sqlite3.connect(
+            str(self.db_path), 
+            check_same_thread=False,
+            timeout=30.0
+        )
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def initialize(self) -> None:
+        """Initialize database schema and connection pool"""
+        if self._initialized:
+            return
+        
+        with self._lock:
+            if self._initialized:
+                return
+            
+            # Create initial connections
+            for _ in range(self.max_connections):
+                conn = self._create_connection()
+                self._connections.put(conn)
+            
+            # Initialize schema
+            with self.get_connection() as conn:
+                self._create_schema(conn)
+            
+            self._initialized = True
+    
+    @contextmanager
+    def get_connection(self):
+        """Get database connection from pool"""
+        if not self._initialized:
+            self.initialize()
+        
+        try:
+            conn = self._connections.get(timeout=10.0)
+            yield conn
+        except queue.Empty:
+            raise ExchangeError("Database connection timeout")
+        finally:
+            try:
+                self._connections.put(conn, timeout=1.0)
+            except queue.Full:
+                conn.close()
+    
+    def _create_schema(self, conn: sqlite3.Connection) -> None:
+        """Create database schema"""
+        schemas = {
+            "trades": """
+                CREATE TABLE IF NOT EXISTS trades(
+                    id TEXT PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    qty REAL NOT NULL,
+                    price REAL NOT NULL,
+                    fee REAL DEFAULT 0.0,
+                    pnl REAL DEFAULT 0.0,
+                    strategy TEXT DEFAULT 'core',
+                    notes TEXT,
+                    correlation_id TEXT,
+                    created_at REAL DEFAULT (unixepoch())
+                );
+            """,
+            "orders": """
+                CREATE TABLE IF NOT EXISTS orders(
+                    id TEXT PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    qty REAL NOT NULL,
+                    price REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    parent_id TEXT,
+                    expires_ts REAL,
+                    correlation_id TEXT,
+                    created_at REAL DEFAULT (unixepoch())
+                );
+            """,
+            "positions": """
+                CREATE TABLE IF NOT EXISTS positions(
+                    symbol TEXT PRIMARY KEY,
+                    qty REAL NOT NULL DEFAULT 0.0,
+                    avg_price REAL NOT NULL DEFAULT 0.0,
+                    sector TEXT,
+                    region TEXT,
+                    updated_at REAL DEFAULT (unixepoch())
+                );
+            """,
+            "metrics": """
+                CREATE TABLE IF NOT EXISTS metrics(
+                    ts REAL NOT NULL,
+                    name TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    metadata TEXT,
+                    correlation_id TEXT,
+                    PRIMARY KEY(ts, name)
+                );
+            """,
+            "audit": """
+                CREATE TABLE IF NOT EXISTS audit(
+                    ts REAL NOT NULL DEFAULT (unixepoch()),
+                    level TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    context TEXT,
+                    correlation_id TEXT
+                );
+            """
+        }
+        
+        cursor = conn.cursor()
+        for table_name, schema in schemas.items():
+            try:
+                cursor.execute(schema)
+                # Create indexes
+                if table_name == "trades":
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trades(symbol, ts);")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_correlation ON trades(correlation_id);")
+                elif table_name == "metrics":
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_metrics_name_ts ON metrics(name, ts);")
+            except sqlite3.Error as e:
+                log_exception(f"Failed to create {table_name} schema", e)
+        
+        conn.commit()
+    
+    def insert_record(self, table: str, record: Dict[str, Any]) -> bool:
+        """Insert record with automatic correlation ID"""
+        try:
+            # Add correlation ID if not present
+            if 'correlation_id' not in record:
+                record['correlation_id'] = getattr(threading.current_thread(), 'correlation_id', 'UNKNOWN')
+            
+            with self.get_connection() as conn:
+                columns = list(record.keys())
+                placeholders = ', '.join(['?' for _ in columns])
+                values = [record[col] for col in columns]
+                
+                query = f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) VALUES ({placeholders})"
+                conn.execute(query, values)
+                conn.commit()
+                return True
+                
+        except sqlite3.Error as e:
+            log_exception(f"Failed to insert into {table}", e, record=record)
+            return False
+    
+    def query_records(
+        self, 
+        query: str, 
+        params: Tuple = (), 
+        fetch_size: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Query records with optional result limiting"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.execute(query, params)
+                
+                if fetch_size:
+                    rows = cursor.fetchmany(fetch_size)
+                else:
+                    rows = cursor.fetchall()
+                
+                return [dict(row) for row in rows]
+                
+        except sqlite3.Error as e:
+            log_exception("Database query failed", e, query=query, params=params)
+            return []
+    
+    def close(self) -> None:
+        """Close all connections"""
+        while not self._connections.empty():
+            try:
+                conn = self._connections.get_nowait()
+                conn.close()
+            except queue.Empty:
+                break
+
+# =============== Enhanced Exchange Manager ===============
+class ExchangeManager:
+    """Enhanced exchange manager with better error handling and caching"""
+    
+    def __init__(self, config: ConfigDict, semaphore: Semaphore, data_manager: DataManager):
+        self.config = config
+        self.paper_mode = bool(config.get("paper", True)) or not HAS_CCXT
+        self.exchange_name = str(config.get("exchange", "binance")).lower()
+        self.semaphore = semaphore
+        self.data_manager = data_manager
+        
+        # Circuit breakers for different operations
+        self.fetch_cb = CircuitBreaker(failure_threshold=5, reset_timeout=60.0)
+        self.ticker_cb = CircuitBreaker(failure_threshold=3, reset_timeout=30.0)
+        
+        # Exchange instance
+        self._exchange: Optional[Any] = None
+        self._exchange_lock = AsyncLock()
+        
+        # Performance tracking
+        self._request_times: deque = deque(maxlen=100)
+        self._last_rate_limit_reset = time.time()
+        self._rate_limit_remaining = 1000
+    
+    async def initialize(self) -> None:
+        """Initialize exchange connection"""
+        if self.paper_mode:
+            log_with_context("info", "Exchange manager in PAPER mode")
+            return
+        
+        if not HAS_CCXT:
+            log_with_context("warning", "CCXT not available, falling back to paper mode")
+            self.paper_mode = True
+            return
+        
+        try:
+            async with self._exchange_lock:
+                if self._exchange is not None:
+                    return
+                
+                exchange_class = getattr(ccxt_async, self.exchange_name, None)
+                if not exchange_class:
+                    raise ExchangeError(f"Exchange {self.exchange_name} not supported")
+                
+                # Load credentials if available
+                credentials = self._load_credentials()
+                
+                self._exchange = exchange_class({
+                    "enableRateLimit": True,
+                    "timeout": self.config.get("performance", {}).get("request_timeout", 30.0) * 1000,
+                    **credentials
+                })
+                
+                # Test connection
+                await self._exchange.load_markets()
+                log_with_context("info", f"Exchange {self.exchange_name} initialized successfully")
+                
+        except Exception as e:
+            log_exception("Exchange initialization failed, falling back to paper mode", e)
+            self.paper_mode = True
+            self._exchange = None
+    
+    def _load_credentials(self) -> Dict[str, str]:
+        """Load encrypted exchange credentials"""
+        if not HAS_CRYPTO:
+            return {}
+        
+        cred_file = DATA_DIR / f"{self.exchange_name}.enc"
+        if not cred_file.exists():
+            return {}
+        
+        try:
+            return self._decrypt_credentials(cred_file)
+        except Exception as e:
+            log_exception("Failed to load credentials", e)
+            return {}
+    
+    def _decrypt_credentials(self, file_path: Path) -> Dict[str, str]:
+        """Decrypt stored credentials"""
+        if not HAS_CRYPTO or not FERNET_KEY_FILE.exists():
+            return {}
+        
+        try:
+            key = FERNET_KEY_FILE.read_bytes()
+            fernet = Fernet(key)
+            
+            encrypted_data = file_path.read_bytes()
+            decrypted_data = fernet.decrypt(encrypted_data)
+            
+            return json.loads(decrypted_data.decode('utf-8'))
+        except Exception as e:
+            raise ExchangeError(f"Failed to decrypt credentials: {e}")
+    
+    @retry_async(max_attempts=3, base_delay=1.0, exceptions=(ExchangeError, asyncio.TimeoutError))
+    async def fetch_ohlcv(
+        self, 
+        symbol: str, 
+        timeframe: str = "1h", 
+        limit: int = 256
+    ) -> Optional['pd.DataFrame']:
+        """Fetch OHLCV data with caching and error handling"""
+        if not HAS_PANDAS:
+            log_with_context("warning", "Pandas not available for OHLCV data")
+            return None
+        
+        # Check circuit breaker
+        if not self.fetch_cb.can_execute():
+            log_with_context("warning", "OHLCV fetch blocked by circuit breaker")
+            await asyncio.sleep(1.0)
+            return None
+        
+        try:
+            # Check cache first
+            cached_data = self.data_manager.get_ohlcv(symbol, timeframe)
+            if cached_data is not None and len(cached_data) >= limit * 0.8:
+                self.fetch_cb.record_success()
+                return cached_data.tail(limit)
+            
+            async with self.semaphore:
+                start_time = time.time()
+                
+                if self.paper_mode or self._exchange is None:
+                    df = self._generate_synthetic_ohlcv(symbol, timeframe, limit)
+                else:
+                    raw_data = await self._exchange.fetch_ohlcv(
+                        symbol, timeframe=timeframe, limit=limit
+                    )
+                    df = self._process_raw_ohlcv(raw_data, symbol)
+                
+                # Track performance
+                request_time = time.time() - start_time
+                self._request_times.append(request_time)
+                
+                if df is not None and not df.empty:
+                    # Cache the data
+                    self.data_manager.store_ohlcv(symbol, timeframe, df)
+                    self.fetch_cb.record_success()
+                    
+                    log_with_context(
+                        "debug", 
+                        f"Fetched {len(df)} OHLCV records",
+                        symbol=symbol, 
+                        timeframe=timeframe,
+                        request_time=f"{request_time:.3f}s"
+                    )
+                
+                return df
+                
+        except Exception as e:
+            self.fetch_cb.record_failure()
+            log_exception("OHLCV fetch failed", e, symbol=symbol, timeframe=timeframe)
+            return None
+    
+    def _generate_synthetic_ohlcv(
+        self, 
+        symbol: str, 
+        timeframe: str, 
+        limit: int
+    ) -> Optional['pd.DataFrame']:
+        """Generate synthetic OHLCV data for paper trading"""
+        if not HAS_PANDAS or not HAS_NUMPY:
+            return None
+        
+        try:
+            # Create realistic price movement
+            end_time = pd.Timestamp.utcnow()
+            freq_map = {"1m": "1T", "5m": "5T", "15m": "15T", "1h": "1H", "4h": "4H", "1d": "1D"}
+            freq = freq_map.get(timeframe, "1H")
+            
+            index = pd.date_range(end=end_time, periods=limit, freq=freq)
+            
+            # Generate realistic price data with volatility
+            base_price = 30000.0 + np.random.normal(0, 1000, 1)[0]
+            returns = np.random.normal(0, 0.002, limit)  # 0.2% daily volatility
+            
+            # Apply some trending behavior
+            trend = np.linspace(-0.001, 0.001, limit)
+            returns += trend
+            
+            prices = base_price * np.exp(np.cumsum(returns))
+            
+            # Generate OHLC from closes
+            highs = prices * (1 + np.abs(np.random.normal(0, 0.001, limit)))
+            lows = prices * (1 - np.abs(np.random.normal(0, 0.001, limit)))
+            opens = np.roll(prices, 1)
+            opens[0] = prices[0]
+            
+            # Generate realistic volume
+            avg_volume = 100.0
+            volumes = np.maximum(0.1, np.random.lognormal(np.log(avg_volume), 0.5, limit))
+            
+            df = pd.DataFrame({
+                "open": opens,
+                "high": highs,
+                "low": lows,
+                "close": prices,
+                "volume": volumes
+            }, index=index)
+            
+            return df
+            
+        except Exception as e:
+            log_exception("Failed to generate synthetic OHLCV", e)
+            return None
+    
+    def _process_raw_ohlcv(self, raw_data: List[List], symbol: str) -> Optional['pd.DataFrame']:
+        """Process raw OHLCV data from exchange"""
+        if not raw_data or not HAS_PANDAS:
+            return None
+        
+        try:
+            df = pd.DataFrame(
+                raw_data,
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
+            
+            # Convert timestamp to datetime index
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df = df.set_index("timestamp")
+            
+            # Ensure numeric types
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            
+            # Validate data integrity
+            if not self._validate_ohlcv_data(df):
+                raise DataValidationError(f"Invalid OHLCV data for {symbol}")
+            
+            return df
+            
+        except Exception as e:
+            log_exception("Failed to process raw OHLCV data", e, symbol=symbol)
+            return None
+    
+    def _validate_ohlcv_data(self, df: 'pd.DataFrame') -> bool:
+        """Validate OHLCV data integrity"""
+        if df is None or df.empty:
+            return False
+        
+        required_columns = {"open", "high", "low", "close", "volume"}
+        if not required_columns.issubset(set(df.columns)):
+            return False
+        
+        # Check for null values
+        if df[list(required_columns)].isnull().any().any():
+            return False
+        
+        # Check for negative values
+        if (df[list(required_columns)] < 0).any().any():
+            return False
+        
+        # Check OHLC relationships
+        invalid_ohlc = (
+            (df["high"] < df["low"]) |
+            (df["high"] < df["open"]) |
+            (df["high"] < df["close"]) |
+            (df["low"] > df["open"]) |
+            (df["low"] > df["close"])
+        )
+        
+        if invalid_ohlc.any():
+            return False
+        
+        return True
+    
+    @retry_async(max_attempts=2, base_delay=0.5)
+    async def get_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get ticker data with caching"""
+        if not self.ticker_cb.can_execute():
+            log_with_context("warning", "Ticker fetch blocked by circuit breaker")
+            await asyncio.sleep(0.5)
+            return None
+        
+        try:
+            async with self.semaphore:
+                if self.paper_mode or self._exchange is None:
+                    price = 30000.0 + random.uniform(-1000, 1000)
+                    ticker = {
+                        "symbol": symbol,
+                        "bid": price - 0.5,
+                        "ask": price + 0.5,
+                        "last": price,
+                        "timestamp": time.time() * 1000
+                    }
+                else:
+                    ticker = await self._exchange.fetch_ticker(symbol)
+                
+                self.ticker_cb.record_success()
+                return ticker
+                
+        except Exception as e:
+            self.ticker_cb.record_failure()
+            log_exception("Ticker fetch failed", e, symbol=symbol)
+            return None
+    
+    async def close(self) -> None:
+        """Close exchange connection"""
+        if self._exchange is not None:
+            try:
+                await self._exchange.close()
+            except Exception as e:
+                log_exception("Error closing exchange connection", e)
+            finally:
+                self._exchange = None
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get performance statistics"""
+        if not self._request_times:
+            return {"avg_request_time": 0.0, "total_requests": 0}
+        
+        return {
+            "avg_request_time": sum(self._request_times) / len(self._request_times),
+            "total_requests": len(self._request_times),
+            "fetch_circuit_breaker": self.fetch_cb.state,
+            "ticker_circuit_breaker": self.ticker_cb.state
+        }
+
+# =============== Enhanced Technical Indicators ===============
+class TechnicalIndicators:
+    """Optimized technical indicators with proper error handling"""
+    
+    @staticmethod
+    def ema(series: 'pd.Series', period: int) -> 'pd.Series':
+        """Exponential Moving Average"""
+        if not HAS_PANDAS or series is None or series.empty:
+            return pd.Series(dtype=float) if HAS_PANDAS else None
+        
+        try:
+            return series.ewm(span=period, adjust=False).mean()
+        except Exception as e:
+            log_exception("EMA calculation failed", e, period=period)
+            return pd.Series(index=series.index, dtype=float)
+    
+    @staticmethod
+    def rsi(series: 'pd.Series', period: int = 14) -> 'pd.Series':
+        """Relative Strength Index with improved calculation"""
+        if not HAS_PANDAS or series is None or series.empty or len(series) < period:
+            return pd.Series(dtype=float) if HAS_PANDAS else None
+        
+        try:
+            delta = series.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period, min_periods=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period, min_periods=period).mean()
+            
+            rs = gain / (loss + 1e-14)  # Avoid division by zero
+            rsi = 100 - (100 / (1 + rs))
+            
+            return rsi
+            
+        except Exception as e:
+            log_exception("RSI calculation failed", e, period=period)
+            return pd.Series(index=series.index, dtype=float)
+    
+    @staticmethod
+    def atr(df: 'pd.DataFrame', period: int = 14) -> 'pd.Series':
+        """Average True Range"""
+        if not HAS_PANDAS or df is None or df.empty:
+            return pd.Series(dtype=float) if HAS_PANDAS else None
+        
+        try:
+            high_low = df["high"] - df["low"]
+            high_close = (df["high"] - df["close"].shift(1)).abs()
+            low_close = (df["low"] - df["close"].shift(1)).abs()
+            
+            true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            atr = true_range.rolling(window=period, min_periods=period).mean()
+            
+            return atr
+            
+        except Exception as e:
+            log_exception("ATR calculation failed", e, period=period)
+            return pd.Series(index=df.index, dtype=float)
+    
+    @staticmethod
+    def bollinger_bands(
+        series: 'pd.Series', 
+        period: int = 20, 
+        std_dev: float = 2.0
+    ) -> Tuple['pd.Series', 'pd.Series', 'pd.Series', 'pd.Series']:
+        """Bollinger Bands with squeeze indicator"""
+        if not HAS_PANDAS or series is None or series.empty:
+            empty_series = pd.Series(dtype=float) if HAS_PANDAS else None
+            return empty_series, empty_series, empty_series, empty_series
+        
+        try:
+            rolling_mean = series.rolling(window=period, min_periods=period).mean()
+            rolling_std = series.rolling(window=period, min_periods=period).std()
+            
+            upper_band = rolling_mean + (rolling_std * std_dev)
+            lower_band = rolling_mean - (rolling_std * std_dev)
+            
+            # Squeeze indicator (normalized band width)
+            squeeze = (upper_band - lower_band) / (rolling_mean + 1e-14)
+            
+            return rolling_mean, upper_band, lower_band, squeeze
+            
+        except Exception as e:
+            log_exception("Bollinger Bands calculation failed", e, period=period)
+            empty_series = pd.Series(index=series.index, dtype=float)
+            return empty_series, empty_series, empty_series, empty_series
+
+# =============== Enhanced Signal Generator ===============
+class SignalGenerator:
+    """Enhanced signal generator with model integration"""
+    
+    def __init__(self, config: ConfigDict):
+        self.config = config
+        self.indicators = TechnicalIndicators()
+        self.models: Dict[str, ModelDict] = {}
+        self._feature_cache: Dict[str, Tuple[np.ndarray, float]] = {}
+        self._cache_max_age = 300  # 5 minutes
+    
+    def add_model(self, name: str, model: Any, model_type: str) -> None:
+        """Add a prediction model"""
+        try:
+            self.models[name] = {
+                "model": model,
+                "type": model_type,
+                "warmup_remaining": 10,
+                "predictions": deque(maxlen=100),
+                "accuracy": 0.0,
+                "last_used": time.time()
+            }
+            log_with_context("info", f"Added model: {name}", model_type=model_type)
+        except Exception as e:
+            log_exception("Failed to add model", e, name=name, model_type=model_type)
+    
+    def _extract_features(self, df: 'pd.DataFrame') -> Optional[np.ndarray]:
+        """Extract features for ML models with caching"""
+        if not HAS_PANDAS or not HAS_NUMPY or df is None or df.empty:
+            return None
+        
+        # Create cache key
+        cache_key = f"{id(df)}_{len(df)}"
+        current_time = time.time()
+        
+        # Check cache
+        if cache_key in self._feature_cache:
+            features, cache_time = self._feature_cache[cache_key]
+            if current_time - cache_time < self._cache_max_age:
+                return features
+        
+        try:
+            # Extract price-based features
+            closes = df["close"].astype(float)
+            
+            if len(closes) < 60:
+                # Pad if needed
+                closes = pd.Series(
+                    np.pad(closes.values, (60 - len(closes), 0), mode="edge"),
+                    index=range(60)
+                )
+            
+            # Normalize returns
+            returns = closes.pct_change().fillna(0.0)
+            features = returns.tail(60).values.reshape(1, -1).astype(np.float32)
+            
+            # Cache features
+            self._feature_cache[cache_key] = (features, current_time)
+            
+            # Cleanup old cache entries
+            if len(self._feature_cache) > 100:
+                oldest_key = min(
+                    self._feature_cache.keys(),
+                    key=lambda k: self._feature_cache[k][1]
+                )
+                del self._feature_cache[oldest_key]
+            
+            return features
+            
+        except Exception as e:
+            log_exception("Feature extraction failed", e)
+            return None
+    
+    def _predict_with_model(
+        self, 
+        model_info: ModelDict, 
+        features: np.ndarray
+    ) -> Tuple[Optional[str], float]:
+        """Make prediction with a single model"""
+        if not HAS_NUMPY:
+            return None, 0.0
+        
+        try:
+            model = model_info["model"]
+            model_type = model_info["type"]
+            
+            if model_type == "sklearn" and hasattr(model, "predict_proba"):
+                proba = model.predict_proba(features)[0]
+                if len(proba) >= 3:  # [hold, buy, sell]
+                    idx = np.argmax(proba)
+                    confidence = float(proba[idx])
+                    action = ["hold", "buy", "sell"][idx]
+                elif len(proba) == 2:  # [bearish, bullish]
+                    confidence = float(proba[1])
+                    action = "buy" if confidence > 0.6 else "sell" if confidence < 0.4 else "hold"
+                else:
+                    return None, 0.0
+                
+                return action, confidence
+            
+            elif hasattr(model, "predict"):
+                prediction = model.predict(features)
+                pred_value = prediction[0] if isinstance(prediction, (list, np.ndarray)) else prediction
+                
+                if isinstance(pred_value, str):
+                    return pred_value.lower(), 0.6
+                elif isinstance(pred_value, (int, float)):
+                    if pred_value > 0.1:
+                        return "buy", min(float(pred_value), 1.0)
+                    elif pred_value < -0.1:
+                        return "sell", min(abs(float(pred_value)), 1.0)
+                    else:
+                        return "hold", 0.5
+            
+            return None, 0.0
+            
+        except Exception as e:
+            log_exception("Model prediction failed", e, model_type=model_info.get("type"))
+            return None, 0.0
+    
+    def _calculate_ta_signals(self, symbol: str, df: 'pd.DataFrame') -> Dict[str, Any]:
+        """Calculate technical analysis signals"""
+        signals_config = self.config.get("signals", {})
+        
+        signal_result = {
+            "symbol": symbol,
+            "action": "hold",
+            "confidence": 0.0,
+            "score": 0.0,
+            "indicators": {}
+        }
+        
+        try:
+            if df is None or df.empty or len(df) < 20:
+                return signal_result
+            
+            close = df["close"]
+            
+            # Calculate indicators
+            rsi = self.indicators.rsi(close, signals_config.get("rsi_period", 14))
+            bb_ma, bb_upper, bb_lower, bb_squeeze = self.indicators.bollinger_bands(
+                close, 
+                signals_config.get("bb_period", 20),
+                signals_config.get("bb_mult", 2.0)
+            )
+            atr = self.indicators.atr(df, 14)
+            
+            if rsi is None or bb_ma is None:
+                return signal_result
+            
+            # Get latest values
+            current_rsi = rsi.iloc[-1] if not rsi.empty else 50.0
+            current_price = close.iloc[-1]
+            current_bb_upper = bb_upper.iloc[-1] if not bb_upper.empty else current_price
+            current_bb_lower = bb_lower.iloc[-1] if not bb_lower.empty else current_price
+            current_squeeze = bb_squeeze.iloc[-1] if not bb_squeeze.empty else 0.1
+            
+            # Store indicator values
+            signal_result["indicators"] = {
+                "rsi": float(current_rsi),
+                "bb_position": float((current_price - current_bb_lower) / (current_bb_upper - current_bb_lower + 1e-14)),
+                "squeeze": float(current_squeeze),
+                "atr_ratio": float(atr.iloc[-1] / current_price) if not atr.empty else 0.0
+            }
+            
+            # Generate signals
+            rsi_buy_threshold = signals_config.get("rsi_buy", 30)
+            rsi_sell_threshold = signals_config.get("rsi_sell", 70)
+            
+            buy_conditions = [
+                current_rsi <= rsi_buy_threshold,
+                current_price <= current_bb_lower,
+                current_squeeze < 0.02  # Low volatility breakout potential
+            ]
+            
+            sell_conditions = [
+                current_rsi >= rsi_sell_threshold,
+                current_price >= current_bb_upper
+            ]
+            
+            buy_score = sum(buy_conditions) / len(buy_conditions)
+            sell_score = sum(sell_conditions) / len(sell_conditions)
+            
+            if buy_score > 0.6 and sell_score < 0.3:
+                signal_result.update({
+                    "action": "buy",
+                    "confidence": buy_score,
+                    "score": buy_score
+                })
+            elif sell_score > 0.6 and buy_score < 0.3:
+                signal_result.update({
+                    "action": "sell", 
+                    "confidence": sell_score,
+                    "score": sell_score
+                })
+            else:
+                signal_result.update({
+                    "action": "hold",
+                    "confidence": 0.5,
+                    "score": 0.5
+                })
+            
+        except Exception as e:
+            log_exception("TA signal calculation failed", e, symbol=symbol)
+        
+        return signal_result
+    
+    def generate_signal(self, symbol: str, df: 'pd.DataFrame') -> Optional[Dict[str, Any]]:
+        """Generate trading signal with model ensemble"""
+        if not HAS_PANDAS or df is None or df.empty:
+            return None
+        
+        try:
+            # Start with TA signals
+            ta_signal = self._calculate_ta_signals(symbol, df)
+            
+            weights = self.config.get("weights", {})
+            ta_weight = weights.get("ta", 0.6)
+            ml_weight = weights.get("ml", 0.3)
+            
+            # Initialize vote aggregation
+            action_votes = {ta_signal["action"]: ta_signal["score"] * ta_weight}
+            
+            # Add ML model predictions
+            features = self._extract_features(df)
+            if features is not None and self.models:
+                ml_predictions = []
+                
+                for name, model_info in self.models.items():
+                    if model_info["warmup_remaining"] > 0:
+                        model_info["warmup_remaining"] -= 1
+                        continue
+                    
+                    action, confidence = self._predict_with_model(model_info, features)
+                    if action:
+                        ml_predictions.append((action, confidence))
+                        model_info["predictions"].append({
+                            "action": action,
+                            "confidence": confidence,
+                            "timestamp": time.time()
+                        })
+                        model_info["last_used"] = time.time()
+                
+                # Ensemble ML predictions
+                if ml_predictions:
+                    for action, confidence in ml_predictions:
+                        weight = confidence * ml_weight / len(ml_predictions)
+                        action_votes[action] = action_votes.get(action, 0.0) + weight
+            
+            # Determine final action
+            if action_votes:
+                best_action = max(action_votes.items(), key=lambda x: x[1])
+                ta_signal["action"] = best_action[0]
+                ta_signal["score"] = best_action[1]
+                ta_signal["confidence"] = min(best_action[1], 1.0)
+            
+            return ta_signal
+            
+        except Exception as e:
+            log_exception("Signal generation failed", e, symbol=symbol)
+            return None
+
+# =============== Enhanced Risk Management ===============
+class RiskManager:
+    """Enhanced risk management with dynamic position sizing"""
+    
+    def __init__(self, config: ConfigDict, db_manager: DatabaseManager):
+        self.config = config
+        self.db_manager = db_manager
+        
+        # Portfolio state
+        self.equity = 100000.0  # Starting equity for paper trading
+        self.daily_pnl = 0.0
+        self.drawdown_peak = self.equity
+        self._equity_lock = threading.RLock()
+        
+        # Risk metrics tracking
+        self.returns_history: deque = deque(maxlen=self.config.get("risk", {}).get("var_window", 200))
+        self.var_cache: Optional[float] = None
+        self.var_last_calculated = 0.0
+        
+        # Position tracking
+        self.position_tracker: Dict[str, Dict[str, float]] = {}
+    
+    def update_equity(self, new_equity: float) -> None:
+        """Thread-safe equity update"""
+        with self._equity_lock:
+            old_equity = self.equity
+            self.equity = float(new_equity)
+            self.drawdown_peak = max(self.drawdown_peak, self.equity)
+            
+            # Calculate daily return
+            if old_equity > 0:
+                daily_return = (self.equity - old_equity) / old_equity
+                self.returns_history.append(daily_return)
+            
+            # Record metric
+            self.db_manager.insert_record("metrics", {
+                "ts": time.time(),
+                "name": "equity",
+                "value": self.equity,
+                "metadata": json.dumps({"daily_pnl": self.daily_pnl})
+            })
+    
+    def calculate_position_size(
+        self, 
+        symbol: str, 
+        df: 'pd.DataFrame', 
+        price: float,
+        signal_strength: float = 1.0
+    ) -> float:
+        """Calculate position size using ATR and risk-adjusted sizing"""
+        try:
+            risk_config = self.config.get("risk", {})
+            positioning_config = self.config.get("positioning", {})
+            
+            # Base risk per trade
+            risk_per_trade = self.equity * risk_config.get("stop_loss_pct", 0.02)
+            
+            # ATR-based position sizing
+            atr_period = positioning_config.get("atr_period", 14)
+            atr_multiplier = positioning_config.get("atr_risk_mult", 1.0)
+            
+            if HAS_PANDAS and df is not None and len(df) >= atr_period:
+                atr_series = TechnicalIndicators.atr(df, atr_period)
+                if not atr_series.empty:
+                    current_atr = atr_series.iloc[-1]
+                    atr_stop_distance = current_atr * atr_multiplier
+                else:
+                    atr_stop_distance = price * 0.02  # Fallback to 2%
+            else:
+                atr_stop_distance = price * 0.02
+            
+            # Calculate base position size
+            if atr_stop_distance > 0:
+                base_size = risk_per_trade / atr_stop_distance
+            else:
+                base_size = 0.0
+            
+            # Adjust for signal strength
+            adjusted_size = base_size * clamp(signal_strength, 0.1, 2.0)
+            
+            # Apply position limits
+            max_position_value = self.equity * risk_config.get("max_single_pos_pct", 0.15)
+            max_size = max_position_value / price if price > 0 else 0.0
+            
+            final_size = min(adjusted_size, max_size)
+            
+            log_with_context(
+                "debug",
+                f"Position size calculated: {final_size:.6f}",
+                symbol=symbol,
+                price=price,
+                atr_stop_distance=atr_stop_distance,
+                signal_strength=signal_strength,
+                risk_per_trade=risk_per_trade
+            )
+            
+            return max(0.0, final_size)
+            
+        except Exception as e:
+            log_exception("Position size calculation failed", e, symbol=symbol)
+            return 0.0
+    
+    def check_risk_limits(
+        self, 
+        symbol: str, 
+        side: str, 
+        price: float, 
+        quantity: float,
+        open_positions: PositionDict
+    ) -> Tuple[bool, str]:
+        """Comprehensive risk limit checking"""
+        try:
+            risk_config = self.config.get("risk", {})
+            
+            # Check maximum drawdown
+            current_drawdown = 1.0 - (self.equity / max(self.drawdown_peak, 1e-12))
+            max_drawdown = risk_config.get("max_drawdown_pct", 0.50)
+            
+            if current_drawdown >= max_drawdown:
+                return False, f"Maximum drawdown exceeded: {current_drawdown:.2%} >= {max_drawdown:.2%}"
+            
+            # Check daily loss limit
+            daily_loss_limit = risk_config.get("daily_loss_limit_pct", 0.10)
+            if self.daily_pnl <= -abs(self.equity * daily_loss_limit):
+                return False, f"Daily loss limit exceeded: {self.daily_pnl:.2f}"
+            
+            # Check portfolio exposure for new positions
+            if side.lower() == "buy":
+                position_value = abs(quantity) * price
+                
+                # Calculate current exposure
+                total_exposure = sum(
+                    abs(pos.get("qty", 0.0)) * pos.get("avg_price", 0.0)
+                    for pos in open_positions.values()
+                )
+                
+                max_portfolio_exposure = risk_config.get("max_portfolio_exposure_pct", 0.80) * self.equity
+                
+                if total_exposure + position_value > max_portfolio_exposure:
+                    return False, f"Portfolio exposure limit exceeded"
+                
+                # Check single position limit
+                max_single_position = risk_config.get("max_single_pos_pct", 0.15) * self.equity
+                current_position_value = open_positions.get(symbol, {}).get("qty", 0.0) * price
+                
+                if current_position_value + position_value > max_single_position:
+                    return False, f"Single position limit exceeded for {symbol}"
+            
+            # Calculate and check VaR if available
+            var_limit = self._calculate_var()
+            if var_limit and hasattr(self, 'portfolio_var'):
+                if self.portfolio_var > var_limit:
+                    return False, f"VaR limit exceeded: {self.portfolio_var:.4f} > {var_limit:.4f}"
+            
+            return True, "Risk checks passed"
+            
+        except Exception as e:
+            log_exception("Risk limit check failed", e, symbol=symbol, side=side)
+            return False, "Risk check error"
+    
+    def _calculate_var(self, confidence_level: float = 0.99) -> Optional[float]:
+        """Calculate Value at Risk"""
+        if len(self.returns_history) < 30:
+            return None
+        
+        # Use cached VaR if recent
+        current_time = time.time()
+        if (self.var_cache is not None and 
+            current_time - self.var_last_calculated < 300):  # 5 minutes cache
+            return self.var_cache
+        
+        try:
+            if not HAS_NUMPY:
+                return None
+            
+            returns_array = np.array(list(self.returns_history))
+            var_percentile = (1 - confidence_level) * 100
+            var_value = np.percentile(returns_array, var_percentile)
+            
+            # Cache the result
+            self.var_cache = abs(var_value)
+            self.var_last_calculated = current_time
+            
+            # Record VaR metric
+            self.db_manager.insert_record("metrics", {
+                "ts": current_time,
+                "name": "var",
+                "value": self.var_cache,
+                "metadata": json.dumps({
+                    "confidence_level": confidence_level,
+                    "sample_size": len(self.returns_history)
+                })
+            })
+            
+            return self.var_cache
+            
+        except Exception as e:
+            log_exception("VaR calculation failed", e)
+            return None
+    
+    def update_daily_pnl(self, pnl_change: float) -> None:
+        """Update daily P&L tracking"""
+        with self._equity_lock:
+            self.daily_pnl += pnl_change
+    
+    def reset_daily_tracking(self) -> None:
+        """Reset daily tracking (call at start of new trading day)"""
+        with self._equity_lock:
+            self.daily_pnl = 0.0
+
+# =============== Enhanced Order Management ===============
+@dataclass
+class Order:
+    """Enhanced order representation"""
+    id: str
+    timestamp: float
+    symbol: str
+    side: str
+    order_type: str
+    quantity: float
+    price: float
+    status: str
+    parent_id: Optional[str] = None
+    expires_at: Optional[float] = None
+    filled_quantity: float = 0.0
+    average_fill_price: float = 0.0
+    correlation_id: str = ""
+
+@dataclass 
+class Position:
+    """Enhanced position representation"""
+    symbol: str
+    quantity: float
+    average_price: float
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    last_updated: float = 0.0
+
+class OrderManager:
+    """Enhanced order management with better tracking"""
+    
+    def __init__(self, db_manager: DatabaseManager, risk_manager: RiskManager):
+        self.db_manager = db_manager
+        self.risk_manager = risk_manager
+        
+        # Thread-safe data structures
+        self.positions: Dict[str, Position] = {}
+        self.active_orders: Dict[str, Order] = {}
+        self._positions_lock = threading.RLock()
+        self._orders_lock = threading.RLock()
+        
+        # Performance tracking
+        self.execution_times: deque = deque(maxlen=100)
+        
+    def submit_market_order(
+        self, 
+        symbol: str, 
+        side: str, 
+        quantity: float, 
+        current_price: float,
+        strategy: str = "core"
+    ) -> Dict[str, Any]:
+        """Submit market order with comprehensive validation"""
+        start_time = time.time()
+        correlation_id = getattr(threading.current_thread(), 'correlation_id', str(uuid.uuid4()))
+        
+        try:
+            # Pre-trade validation
+            with self._positions_lock:
+                positions_copy = {k: asdict(v) for k, v in self.positions.items()}
+            
+            can_trade, risk_reason = self.risk_manager.check_risk_limits(
+                symbol, side, current_price, quantity, positions_copy
+            )
+            
+            if not can_trade:
+                log_with_context(
+                    "warning", 
+                    "Order rejected by risk management",
+                    symbol=symbol, 
+                    side=side, 
+                    reason=risk_reason
+                )
+                return {
+                    "status": "rejected",
+                    "reason": risk_reason,
+                    "order_id": None
+                }
+            
+            # Create order
+            order = Order(
+                id=str(uuid.uuid4()),
+                timestamp=time.time(),
+                symbol=symbol,
+                side=side.lower(),
+                order_type="market",
+                quantity=abs(quantity),
+                price=current_price,
+                status="filled",  # Immediate fill for paper trading
+                correlation_id=correlation_id
+            )
+            
+            # Execute order
+            execution_result = self._execute_order(order, current_price)
+            
+            # Record execution time
+            execution_time = time.time() - start_time
+            self.execution_times.append(execution_time)
+            
+            log_with_context(
+                "info",
+                f"Order executed: {side.upper()} {quantity:.6f} {symbol} @ {current_price:.2f}",
+                order_id=order.id,
+                execution_time=f"{execution_time:.3f}s",
+                strategy=strategy
+            )
+            
+            return {
+                "status": "filled",
+                "order_id": order.id,
+                "executed_price": current_price,
+                "executed_quantity": quantity,
+                "execution_time": execution_time
+            }
+            
+        except Exception as e:
+            log_exception("Order submission failed", e, symbol=symbol, side=side)
+            return {
+                "status": "error", 
+                "reason": str(e),
+                "order_id": None
+            }
+    
+    def _execute_order(self, order: Order, execution_price: float) -> bool:
+        """Execute order and update positions"""
+        try:
+            with self._positions_lock:
+                # Get or create position
+                if order.symbol not in self.positions:
+                    self.positions[order.symbol] = Position(
+                        symbol=order.symbol,
+                        quantity=0.0,
+                        average_price=0.0,
+                        last_updated=time.time()
+                    )
+                
+                position = self.positions[order.symbol]
+                old_quantity = position.quantity
+                old_avg_price = position.average_price
+                
+                if order.side == "buy":
+                    # Calculate new average price for buys
+                    total_cost = (old_quantity * old_avg_price) + (order.quantity * execution_price)
+                    new_quantity = old_quantity + order.quantity
+                    
+                    if new_quantity > 0:
+                        position.average_price = total_cost / new_quantity
+                    position.quantity = new_quantity
+                    
+                elif order.side == "sell":
+                    # Calculate realized P&L for sells
+                    if old_quantity > 0:
+                        sell_quantity = min(order.quantity, old_quantity)
+                        realized_pnl = (execution_price - old_avg_price) * sell_quantity
+                        position.realized_pnl += realized_pnl
+                        position.quantity = max(0.0, old_quantity - order.quantity)
+                        
+                        # Update risk manager with P&L
+                        self.risk_manager.update_daily_pnl(realized_pnl)
+                    
+                    # If position goes negative (short), calculate new average
+                    if position.quantity < 0:
+                        position.average_price = execution_price
+                
+                position.last_updated = time.time()
+                
+                # Record trade in database
+                trade_record = {
+                    "id": order.id,
+                    "ts": order.timestamp,
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "qty": order.quantity,
+                    "price": execution_price,
+                    "fee": 0.0,  # Paper trading
+                    "pnl": position.realized_pnl if order.side == "sell" else 0.0,
+                    "strategy": "core",
+                    "notes": f"Market order execution",
+                    "correlation_id": order.correlation_id
+                }
+                
+                self.db_manager.insert_record("trades", trade_record)
+                
+                # Update position in database
+                position_record = {
+                    "symbol": position.symbol,
+                    "qty": position.quantity,
+                    "avg_price": position.average_price,
+                    "sector": "",
+                    "region": ""
+                }
+                
+                self.db_manager.insert_record("positions", position_record)
+                
+                return True
+                
+        except Exception as e:
+            log_exception("Order execution failed", e, order_id=order.id)
+            return False
+    
+    def get_position(self, symbol: str) -> Optional[Position]:
+        """Get current position for symbol"""
+        with self._positions_lock:
+            return self.positions.get(symbol)
+    
+    def get_all_positions(self) -> Dict[str, Position]:
+        """Get all current positions"""
+        with self._positions_lock:
+            return self.positions.copy()
+    
+    def update_unrealized_pnl(self, symbol: str, current_price: float) -> None:
+        """Update unrealized P&L for position"""
+        with self._positions_lock:
+            if symbol in self.positions:
+                position = self.positions[symbol]
+                if position.quantity != 0:
+                    position.unrealized_pnl = (current_price - position.average_price) * position.quantity
+    
+    def get_portfolio_value(self, current_prices: PriceDict) -> float:
+        """Calculate total portfolio value"""
+        with self._positions_lock:
+            total_value = 0.0
+            
+            for symbol, position in self.positions.items():
+                if position.quantity != 0 and symbol in current_prices:
+                    position_value = position.quantity * current_prices[symbol]
+                    total_value += position_value
+            
+            return total_value
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get order management performance statistics"""
+        if not self.execution_times:
+            return {"avg_execution_time": 0.0, "total_orders": 0}
+        
+        return {
+            "avg_execution_time": sum(self.execution_times) / len(self.execution_times),
+            "total_orders": len(self.execution_times),
+            "active_positions": len([p for p in self.positions.values() if p.quantity != 0])
+        }
+
+# =============== Enhanced Loki Core ===============
+class LokiCore:
+    """Enhanced main trading system core"""
+    
+    def __init__(self, config: ConfigDict):
+        self.config = config
+        self.correlation_id = str(uuid.uuid4())
+        set_correlation_id(self.correlation_id)
+        
+        # Initialize components
+        self.db_manager = DatabaseManager(DB_PATH)
+        self.data_manager = DataManager(
+            max_symbols=config.get("performance", {}).get("max_symbols", 100),
+            max_rows_per_symbol=config.get("performance", {}).get("max_rows_per_symbol", 1000)
+        )
+        
+        # Create semaphore for concurrency control
+        max_concurrent = config.get("performance", {}).get("max_concurrent_requests", 8)
+        self.semaphore = Semaphore(max_concurrent)
+        
+        # Initialize managers
+        self.exchange = ExchangeManager(config, self.semaphore, self.data_manager)
+        self.risk_manager = RiskManager(config, self.db_manager)
+        self.order_manager = OrderManager(self.db_manager, self.risk_manager)
+        self.signal_generator = SignalGenerator(config)
+        
+        # System state
+        self.running = False
+        self.trading_task: Optional[asyncio.Task] = None
+        self._shutdown_event = asyncio.Event()
+        
+        # Performance monitoring
+        self.start_time = time.time()
+        self.cycle_times: deque = deque(maxlen=100)
+        self.error_count = 0
+        self.max_consecutive_errors = 10
+        
+        log_with_context("info", "Loki Core initialized", correlation_id=self.correlation_id)
+    
+    async def initialize(self) -> None:
+        """Initialize all system components"""
+        try:
+            # Initialize database
+            self.db_manager.initialize()
+            
+            # Initialize exchange
+            await self.exchange.initialize()
+            
+            # Load any saved models
+            await self._load_models()
+            
+            log_with_context("info", "System initialization completed")
+            
+        except Exception as e:
+            log_exception("System initialization failed", e)
+            raise
+    
+    async def _load_models(self) -> None:
+        """Load ML models from models directory"""
+        if not MODELS_DIR.exists():
+            return
+        
+        try:
+            model_files = list(MODELS_DIR.glob("*.pkl")) + list(MODELS_DIR.glob("*.joblib"))
+            
+            for model_file in model_files:
+                try:
+                    model_name = model_file.stem
+                    # This is a simplified model loading - in production you'd want more sophisticated model management
+                    log_with_context("info", f"Found model file: {model_name}", path=str(model_file))
+                    
+                except Exception as e:
+                    log_exception(f"Failed to load model {model_file}", e)
+                    
+        except Exception as e:
+            log_exception("Model loading failed", e)
+    
+    async def start_trading(self) -> bool:
+        """Start the trading system"""
+        if self.running:
+            log_with_context("warning", "Trading system already running")
+            return False
+        
+        try:
+            await self.initialize()
+            
+            self.running = True
+            self._shutdown_event.clear()
+            
+            # Start trading loop
+            self.trading_task = asyncio.create_task(self._trading_loop())
+            
+            log_with_context("info", "Trading system started")
+            return True
+            
+        except Exception as e:
+            log_exception("Failed to start trading system", e)
+            self.running = False
+            return False
+    
+    async def stop_trading(self) -> None:
+        """Stop the trading system gracefully"""
+        if not self.running:
+            return
+        
+        log_with_context("info", "Stopping trading system...")
+        
+        self.running = False
+        self._shutdown_event.set()
+        
+        # Cancel trading task
+        if self.trading_task and not self.trading_task.done():
+            self.trading_task.cancel()
+            try:
+                await asyncio.wait_for(self.trading_task, timeout=10.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        
+        # Close resources
+        await self.exchange.close()
+        self.db_manager.close()
+        self.data_manager.clear()
+        
+        log_with_context("info", "Trading system stopped")
+    
+    async def _trading_loop(self) -> None:
+        """Main trading loop with enhanced error handling"""
+        assets = self.config.get("assets", [])
+        timeframes = self.config.get("timeframes", ["1h"])
+        poll_interval = self.config.get("poll_interval", 5.0)
+        
+        consecutive_errors = 0
+        
+        while self.running and not self._shutdown_event.is_set():
+            cycle_start = time.time()
+            
+            try:
+                # Process each asset
+                tasks = []
+                for symbol in assets:
+                    task = asyncio.create_task(
+                        self._process_symbol(symbol, timeframes),
+                        name=f"process_{symbol}"
+                    )
+                    tasks.append(task)
+                
+                # Wait for all tasks with timeout
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=poll_interval * 2
+                    )
+                    consecutive_errors = 0  # Reset error count on success
+                    
+                except asyncio.TimeoutError:
+                    log_with_context("warning", "Trading cycle timed out")
+                    consecutive_errors += 1
+                
+                # Update cycle time
+                cycle_time = time.time() - cycle_start
+                self.cycle_times.append(cycle_time)
+                
+                # Check for excessive consecutive errors
+                if consecutive_errors >= self.max_consecutive_errors:
+                    log_with_context("error", "Too many consecutive errors, stopping system")
+                    await self.stop_trading()
+                    break
+                
+                # Wait for next cycle
+                remaining_time = max(0, poll_interval - cycle_time)
+                if remaining_time > 0:
+                    await asyncio.sleep(remaining_time)
+                
+                # Periodic cleanup
+                if time.time() % 300 < poll_interval:  # Every 5 minutes
+                    gc.collect()
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                consecutive_errors += 1
+                self.error_count += 1
+                log_exception("Trading loop error", e)
+                
+                # Exponential backoff on errors
+                error_delay = min(poll_interval * (2 ** min(consecutive_errors, 5)), 60.0)
+                await asyncio.sleep(error_delay)
+    
+    async def _process_symbol(self, symbol: str, timeframes: List[str]) -> None:
+        """Process a single trading symbol"""
+        symbol_correlation_id = f"{self.correlation_id}_{symbol}_{int(time.time())}"
+        set_correlation_id(symbol_correlation_id)
+        
+        try:
+            # Fetch market data for primary timeframe
+            primary_timeframe = timeframes[0] if timeframes else "1h"
+            
+            df = await self.exchange.fetch_ohlcv(symbol, primary_timeframe, limit=256)
+            
+            if df is None or df.empty:
+                log_with_context("debug", f"No data available for {symbol}")
+                return
+            
+            # Generate trading signal
+            signal = self.signal_generator.generate_signal(symbol, df)
+            
+            if not signal:
+                return
+            
+            # Get current price
+            ticker = await self.exchange.get_ticker(symbol)
+            current_price = ticker.get("last", df["close"].iloc[-1]) if ticker else df["close"].iloc[-1]
+            
+            # Update unrealized P&L
+            self.order_manager.update_unrealized_pnl(symbol, current_price)
+            
+            # Process signal
+            await self._execute_signal(symbol, signal, current_price, df)
+            
+        except Exception as e:
+            log_exception("Symbol processing failed", e, symbol=symbol)
+    
+    async def _execute_signal(
+        self, 
+        symbol: str, 
+        signal: Dict[str, Any], 
+        current_price: float,
+        df: 'pd.DataFrame'
+    ) -> None:
+        """Execute trading signal"""
+        action = signal.get("action", "hold")
+        confidence = signal.get("confidence", 0.0)
+        
+        if action == "hold" or confidence < 0.5:
+            return
+        
+        try:
+            # Get current position
+            position = self.order_manager.get_position(symbol)
+            current_quantity = position.quantity if position else 0.0
+            
+            if action == "buy" and current_quantity <= 0:
+                # Calculate position size
+                quantity = self.risk_manager.calculate_position_size(
+                    symbol, df, current_price, confidence
+                )
+                
+                if quantity > 0:
+                    result = self.order_manager.submit_market_order(
+                        symbol, "buy", quantity, current_price
+                    )
+                    
+                    if result["status"] == "filled":
+                        log_with_context(
+                            "info",
+                            f"BUY order filled",
+                            symbol=symbol,
+                            quantity=quantity,
+                            price=current_price,
+                            confidence=confidence
+                        )
+            
+            elif action == "sell" and current_quantity > 0:
+                # Sell current position
+                result = self.order_manager.submit_market_order(
+                    symbol, "sell", current_quantity, current_price
+                )
+                
+                if result["status"] == "filled":
+                    log_with_context(
+                        "info",
+                        f"SELL order filled",
+                        symbol=symbol,
+                        quantity=current_quantity,
+                        price=current_price,
+                        confidence=confidence
+                    )
+                    
+        except Exception as e:
+            log_exception("Signal execution failed", e, symbol=symbol, action=action)
+    
+    def get_system_status(self) -> Dict[str, Any]:
+        """Get comprehensive system status"""
+        try:
+            current_time = time.time()
+            uptime = current_time - self.start_time
+            
+            # Portfolio summary
+            positions = self.order_manager.get_all_positions()
+            active_positions = {k: v for k, v in positions.items() if v.quantity != 0}
+            
+            # Performance metrics
+            avg_cycle_time = sum(self.cycle_times) / len(self.cycle_times) if self.cycle_times else 0.0
+            
+            return {
+                "system": {
+                    "running": self.running,
+                    "uptime_seconds": uptime,
+                    "correlation_id": self.correlation_id,
+                    "paper_mode": self.exchange.paper_mode,
+                    "error_count": self.error_count
+                },
+                "performance": {
+                    "avg_cycle_time": avg_cycle_time,
+                    "total_cycles": len(self.cycle_times),
+                    "exchange_stats": self.exchange.get_performance_stats(),
+                    "order_stats": self.order_manager.get_performance_stats()
+                },
+                "portfolio": {
+                    "equity": self.risk_manager.equity,
+                    "daily_pnl": self.risk_manager.daily_pnl,
+                    "active_positions": len(active_positions),
+                    "positions": {k: asdict(v) for k, v in active_positions.items()}
+                },
+                "risk": {
+                    "current_drawdown": 1.0 - (self.risk_manager.equity / max(self.risk_manager.drawdown_peak, 1e-12)),
+                    "var": self.risk_manager._calculate_var(),
+                    "returns_samples": len(self.risk_manager.returns_history)
+                },
+                "memory": {
+                    "data_manager_usage": self.data_manager.get_memory_usage(),
+                    "total_datasets": len(self.data_manager._data)
+                }
+            }
+            
+        except Exception as e:
+            log_exception("Failed to get system status", e)
+            return {"error": str(e)}
+
+# =============== Enhanced CLI Interface ===============
+class CLIInterface:
+    """Enhanced command-line interface"""
+    
+    def __init__(self, core: LokiCore):
+        self.core = core
+        self.running = True
+    
+    def display_banner(self) -> None:
+        """Display system banner"""
+        banner = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚀 LOKI TRADING SYSTEM F1 - Enhanced Version 🚀
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        print(banner)
+    
+    def display_menu(self) -> None:
+        """Display main menu"""
+        menu = """
+1) 📈 Start Trading System
+2) 🛑 Stop Trading System  
+3) 📊 Show System Status
+4) 💼 Show Portfolio
+5) 📈 Show Performance Metrics
+6) 🔧 System Configuration
+7) 🧹 Clear Data Cache
+8) 📋 Export System Report
+9) ❌ Exit
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        print(menu)
+    
+    async def run(self) -> None:
+        """Run the CLI interface"""
+        self.display_banner()
+        
+        while self.running:
+            try:
+                self.display_menu()
+                choice = input("🔸 Enter your choice: ").strip()
+                
+                await self.handle_choice(choice)
+                
+            except KeyboardInterrupt:
+                print("\n👋 Shutdown requested...")
+                await self.handle_choice("9")
+                break
+            except EOFError:
+                break
+            except Exception as e:
+                log_exception("CLI error", e)
+                print(f"❌ Error: {e}")
+    
+    async def handle_choice(self, choice: str) -> None:
+        """Handle user menu choice"""
+        try:
+            if choice == "1":
+                await self._start_trading()
+            elif choice == "2":
+                await self._stop_trading()
+            elif choice == "3":
+                await self._show_status()
+            elif choice == "4":
+                await self._show_portfolio()
+            elif choice == "5":
+                await self._show_performance()
+            elif choice == "6":
+                await self._show_configuration()
+            elif choice == "7":
+                await self._clear_cache()
+            elif choice == "8":
+                await self._export_report()
+            elif choice == "9":
+                await self._exit()
+            else:
+                print("❓ Invalid choice. Please try again.")
+                
+        except Exception as e:
+            log_exception("Choice handling error", e, choice=choice)
+            print(f"❌ Error handling choice: {e}")
+    
+    async def _start_trading(self) -> None:
+        """Start trading system"""
+        print("🚀 Starting trading system...")
+        success = await self.core.start_trading()
+        
+        if success:
+            print("✅ Trading system started successfully!")
+        else:
+            print("❌ Failed to start trading system. Check logs for details.")
+    
+    async def _stop_trading(self) -> None:
+        """Stop trading system"""
+        print("🛑 Stopping trading system...")
+        await self.core.stop_trading()
+        print("✅ Trading system stopped.")
+    
+    async def _show_status(self) -> None:
+        """Show system status"""
+        print("\n" + "="*80)
+        print("📊 SYSTEM STATUS")
+        print("="*80)
+        
+        status = self.core.get_system_status()
+        
+        # System info
+        system = status.get("system", {})
+        print(f"🟢 Running: {system.get('running', False)}")
+        print(f"📄 Paper Mode: {system.get('paper_mode', True)}")
+        print(f"⏱️  Uptime: {system.get('uptime_seconds', 0):.0f} seconds")
+        print(f"❌ Error Count: {system.get('error_count', 0)}")
+        
+        # Performance info
+        performance = status.get("performance", {})
+        print(f"🔄 Avg Cycle Time: {performance.get('avg_cycle_time', 0):.3f}s")
+        print(f"📈 Total Cycles: {performance.get('total_cycles', 0)}")
+        
+        # Portfolio info
+        portfolio = status.get("portfolio", {})
+        print(f"💰 Equity: ${portfolio.get('equity', 0):,.2f}")
+        print(f"📊 Daily P&L: ${portfolio.get('daily_pnl', 0):,.2f}")
+        print(f"🎯 Active Positions: {portfolio.get('active_positions', 0)}")
+        
+        # Risk info
+        risk = status.get("risk", {})
+        print(f"📉 Current Drawdown: {risk.get('current_drawdown', 0):.2%}")
+        if risk.get('var'):
+            print(f"⚠️  VaR: {risk.get('var', 0):.4f}")
+        
+        print("="*80)
+    
+    async def _show_portfolio(self) -> None:
+        """Show portfolio details"""
+        print("\n" + "="*80)
+        print("💼 PORTFOLIO DETAILS")
+        print("="*80)
+        
+        positions = self.core.order_manager.get_all_positions()
+        active_positions = {k: v for k, v in positions.items() if v.quantity != 0}
+        
+        if not active_positions:
+            print("📭 No active positions")
+        else:
+            print(f"{'Symbol':<12} {'Qty':<12} {'Avg Price':<12} {'Unrealized P&L':<15}")
+            print("-" * 60)
+            
+            total_unrealized = 0.0
+            for symbol, position in active_positions.items():
+                print(f"{symbol:<12} {position.quantity:<12.6f} {position.average_price:<12.2f} ${position.unrealized_pnl:<15.2f}")
+                total_unrealized += position.unrealized_pnl
+            
+            print("-" * 60)
+            print(f"{'Total Unrealized P&L:':<39} ${total_unrealized:>15.2f}")
+        
+        print("="*80)
+    
+    async def _show_performance(self) -> None:
+        """Show performance metrics"""
+        print("\n" + "="*80)
+        print("📈 PERFORMANCE METRICS")
+        print("="*80)
+        
+        status = self.core.get_system_status()
+        
+        # Exchange performance
+        exchange_stats = status.get("performance", {}).get("exchange_stats", {})
+        print("📡 Exchange Performance:")
+        print(f"   Average Request Time: {exchange_stats.get('avg_request_time', 0):.3f}s")
+        print(f"   Total Requests: {exchange_stats.get('total_requests', 0)}")
+        print(f"   Fetch Circuit Breaker: {exchange_stats.get('fetch_circuit_breaker', 'UNKNOWN')}")
+        
+        # Order performance
+        order_stats = status.get("performance", {}).get("order_stats", {})
+        print("\n📋 Order Management:")
+        print(f"   Average Execution Time: {order_stats.get('avg_execution_time', 0):.3f}s")
+        print(f"   Total Orders: {order_stats.get('total_orders', 0)}")
+        
+        # Memory usage
+        memory = status.get("memory", {})
+        print("\n💾 Memory Usage:")
+        print(f"   Total Datasets: {memory.get('total_datasets', 0)}")
+        
+        usage = memory.get("data_manager_usage", {})
+        if usage:
+            total_memory = sum(usage.values())
+            print(f"   Total Memory: {total_memory:,} bytes")
+            for symbol, mem in usage.items():
+                print(f"   {symbol}: {mem:,} bytes")
+        
+        print("="*80)
+    
+    async def _show_configuration(self) -> None:
+        """Show current configuration"""
+        print("\n" + "="*80)
+        print("🔧 SYSTEM CONFIGURATION")
+        print("="*80)
+        
+        # Display key configuration sections
+        config_sections = {
+            "Trading": {
+                "Paper Mode": self.core.config.get("paper", True),
+                "Exchange": self.core.config.get("exchange", "binance"),
+                "Assets": ", ".join(self.core.config.get("assets", [])),
+                "Poll Interval": f"{self.core.config.get('poll_interval', 5.0)}s"
+            },
+            "Risk Management": self.core.config.get("risk", {}),
+            "Signal Weights": self.core.config.get("weights", {}),
+            "Performance": self.core.config.get("performance", {})
+        }
+        
+        for section_name, section_data in config_sections.items():
+            print(f"\n📋 {section_name}:")
+            if isinstance(section_data, dict):
+                for key, value in section_data.items():
+                    print(f"   {key}: {value}")
+            else:
+                print(f"   {section_data}")
+        
+        print("="*80)
+    
+    async def _clear_cache(self) -> None:
+        """Clear data cache"""
+        print("🧹 Clearing data cache...")
+        
+        # Clear data manager cache
+        self.core.data_manager.clear()
+        
+        # Force garbage collection
+        gc.collect()
+        
+        print("✅ Cache cleared successfully!")
+    
+    async def _export_report(self) -> None:
+        """Export system report"""
+        print("📋 Generating system report...")
+        
+        try:
+            # Get comprehensive status
+            status = self.core.get_system_status()
+            
+            # Add timestamp and additional info
+            report = {
+                "generated_at": utc_timestamp(),
+                "generated_by": "loki_f1",
+                "system_status": status,
+                "configuration": self.core.config
+            }
+            
+            # Save to file
+            timestamp = int(utc_timestamp())
+            filename = REPORTS_DIR / f"loki_system_report_{timestamp}.json"
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(report, f, indent=2, default=str)
+            
+            print(f"✅ Report exported to: {filename}")
+            
+        except Exception as e:
+            log_exception("Report export failed", e)
+            print(f"❌ Failed to export report: {e}")
+    
+    async def _exit(self) -> None:
+        """Exit the application"""
+        print("👋 Shutting down system...")
+        
+        # Stop trading if running
+        if self.core.running:
+            await self.core.stop_trading()
+        
+        self.running = False
+        print("✅ Goodbye!")
+
+# =============== Enhanced Backtesting Engine ===============
+class BacktestEngine:
+    """Memory-efficient backtesting engine"""
+    
+    def __init__(self, config: ConfigDict):
+        self.config = config
+        self.results: Dict[str, Any] = {}
+    
+    async def run_backtest(
+        self, 
+        symbol: str, 
+        timeframe: str = "1h",
+        days: int = 90,
+        initial_capital: float = 10000.0,
+        fee_bps: float = 1.0
+    ) -> Dict[str, Any]:
+        """Run comprehensive backtest"""
+        try:
+            log_with_context("info", f"Starting backtest for {symbol}", timeframe=timeframe, days=days)
+            
+            # Create test exchange manager
+            test_exchange = ExchangeManager(self.config, Semaphore(1), DataManager())
+            test_exchange.paper_mode = True  # Force paper mode
+            await test_exchange.initialize()
+            
+            # Fetch historical data
+            limit = max(100, int(days * (24 if timeframe.endswith("h") else 1)) + 50)
+            df = await test_exchange.fetch_ohlcv(symbol, timeframe, limit)
+            
+            if df is None or df.empty:
+                return {"success": False, "error": "No data available"}
+            
+            # Trim to requested period
+            df = df.tail(days if timeframe == "1d" else days * 24)
+            
+            # Initialize backtest components
+            bt_risk_manager = RiskManager(self.config, DatabaseManager(":memory:"))
+            bt_risk_manager.equity = initial_capital
+            
+            bt_signal_generator = SignalGenerator(self.config)
+            
+            # Simulation state
+            cash = initial_capital
+            position_qty = 0.0
+            trades = []
+            equity_curve = []
+            last_trade_price = 0.0
+            
+            # Run simulation
+            for i, (timestamp, row) in enumerate(df.iterrows()):
+                current_price = float(row["close"])
+                
+                # Record equity
+                portfolio_value = cash + (position_qty * current_price)
+                equity_curve.append({
+                    "timestamp": timestamp.timestamp() if hasattr(timestamp, 'timestamp') else float(timestamp),
+                    "equity": portfolio_value,
+                    "cash": cash,
+                    "position_value": position_qty * current_price
+                })
+                
+                # Update equity in risk manager for position sizing
+                bt_risk_manager.update_equity(portfolio_value)
+                
+                # Generate signal using window of data up to current point
+                window_start = max(0, i - 256)
+                window_df = df.iloc[window_start:i+1]
+                
+                if len(window_df) < 20:
+                    continue
+                
+                signal = bt_signal_generator.generate_signal(symbol, window_df)
+                
+                if not signal:
+                    continue
+                
+                action = signal.get("action", "hold")
+                confidence = signal.get("confidence", 0.0)
+                
+                # Execute trades based on signals
+                if action == "buy" and position_qty == 0 and confidence > 0.5:
+                    # Calculate position size
+                    position_size = bt_risk_manager.calculate_position_size(
+                        symbol, window_df, current_price, confidence
+                    )
+                    
+                    if position_size > 0:
+                        trade_value = position_size * current_price
+                        fee = trade_value * (fee_bps / 10000)
+                        
+                        if cash >= trade_value + fee:
+                            cash -= (trade_value + fee)
+                            position_qty = position_size
+                            last_trade_price = current_price
+                            
+                            trades.append({
+                                "timestamp": timestamp.timestamp() if hasattr(timestamp, 'timestamp') else float(timestamp),
+                                "action": "buy",
+                                "price": current_price,
+                                "quantity": position_size,
+                                "fee": fee,
+                                "cash_after": cash
+                            })
+                
+                elif action == "sell" and position_qty > 0:
+                    # Sell position
+                    trade_value = position_qty * current_price
+                    fee = trade_value * (fee_bps / 10000)
+                    pnl = (current_price - last_trade_price) * position_qty - fee
+                    
+                    cash += (trade_value - fee)
+                    
+                    trades.append({
+                        "timestamp": timestamp.timestamp() if hasattr(timestamp, 'timestamp') else float(timestamp),
+                        "action": "sell",
+                        "price": current_price,
+                        "quantity": position_qty,
+                        "fee": fee,
+                        "pnl": pnl,
+                        "cash_after": cash
+                    })
+                    
+                    position_qty = 0.0
+            
+            # Close any remaining position
+            if position_qty > 0:
+                final_price = float(df["close"].iloc[-1])
+                trade_value = position_qty * final_price
+                fee = trade_value * (fee_bps / 10000)
+                pnl = (final_price - last_trade_price) * position_qty - fee
+                
+                cash += (trade_value - fee)
+                
+                trades.append({
+                    "timestamp": df.index[-1].timestamp() if hasattr(df.index[-1], 'timestamp') else float(df.index[-1]),
+                    "action": "sell",
+                    "price": final_price,
+                    "quantity": position_qty,
+                    "fee": fee,
+                    "pnl": pnl,
+                    "cash_after": cash
+                })
+            
+            # Calculate metrics
+            final_equity = cash
+            total_return = (final_equity - initial_capital) / initial_capital
+            
+            # Calculate additional metrics
+            metrics = self._calculate_metrics(equity_curve, trades)
+            
+            results = {
+                "success": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "days": days,
+                "initial_capital": initial_capital,
+                "final_equity": final_equity,
+                "total_return": total_return,
+                "total_trades": len(trades),
+                "winning_trades": len([t for t in trades if t.get("pnl", 0) > 0]),
+                "losing_trades": len([t for t in trades if t.get("pnl", 0) < 0]),
+                "metrics": metrics,
+                "equity_curve": equity_curve[-500:],  # Limit size
+                "trades": trades[-100:]  # Limit size
+            }
+            
+            await test_exchange.close()
+            
+            log_with_context("info", "Backtest completed", 
+                           symbol=symbol, 
+                           total_return=f"{total_return:.2%}",
+                           total_trades=len(trades))
+            
+            return results
+            
+        except Exception as e:
+            log_exception("Backtest failed", e, symbol=symbol)
+            return {"success": False, "error": str(e)}
+    
+    def _calculate_metrics(self, equity_curve: List[Dict], trades: List[Dict]) -> Dict[str, float]:
+        """Calculate performance metrics"""
+        if not equity_curve or len(equity_curve) < 2:
+            return {}
+        
+        try:
+            if not HAS_NUMPY:
+                return {"error": "numpy_required"}
+            
+            # Extract equity values
+            equity_values = np.array([point["equity"] for point in equity_curve])
+            
+            # Calculate returns
+            returns = np.diff(equity_values) / equity_values[:-1]
+            returns = returns[~np.isnan(returns)]  # Remove NaN values
+            
+            if len(returns) == 0:
+                return {}
+            
+            # Basic metrics
+            total_return = (equity_values[-1] - equity_values[0]) / equity_values[0]
+            
+            # Volatility (annualized)
+            volatility = np.std(returns) * np.sqrt(252 * 24)  # Assuming hourly data
+            
+            # Sharpe ratio (assuming 0% risk-free rate)
+            sharpe_ratio = (np.mean(returns) / np.std(returns)) * np.sqrt(252 * 24) if np.std(returns) > 0 else 0
+            
+            # Maximum drawdown
+            running_max = np.maximum.accumulate(equity_values)
+            drawdown = (running_max - equity_values) / running_max
+            max_drawdown = np.max(drawdown)
+            
+            # Sortino ratio
+            downside_returns = returns[returns < 0]
+            downside_deviation = np.std(downside_returns) if len(downside_returns) > 0 else 0
+            sortino_ratio = (np.mean(returns) / downside_deviation) * np.sqrt(252 * 24) if downside_deviation > 0 else 0
+            
+            # Win rate
+            profitable_trades = [t for t in trades if t.get("pnl", 0) > 0]
+            win_rate = len(profitable_trades) / len(trades) if trades else 0
+            
+            # Average win/loss
+            wins = [t["pnl"] for t in trades if t.get("pnl", 0) > 0]
+            losses = [t["pnl"] for t in trades if t.get("pnl", 0) < 0]
+            
+            avg_win = np.mean(wins) if wins else 0
+            avg_loss = np.mean(losses) if losses else 0
+            profit_factor = abs(sum(wins) / sum(losses)) if losses and sum(losses) != 0 else 0
+            
+            return {
+                "total_return": float(total_return),
+                "volatility": float(volatility),
+                "sharpe_ratio": float(sharpe_ratio),
+                "sortino_ratio": float(sortino_ratio),
+                "max_drawdown": float(max_drawdown),
+                "win_rate": float(win_rate),
+                "profit_factor": float(profit_factor),
+                "avg_win": float(avg_win),
+                "avg_loss": float(avg_loss)
+            }
+            
+        except Exception as e:
+            log_exception("Metrics calculation failed", e)
+            return {"error": str(e)}
+
+# =============== Main Application Entry Point ===============
+async def main():
+    """Enhanced main function with proper error handling"""
+    try:
+        # Set main thread correlation ID
+        set_correlation_id("MAIN")
+        
+        # Load configuration
+        log_with_context("info", "Loading configuration...")
+        config = load_config()
+        
+        # Initialize core system
+        log_with_context("info", "Initializing Loki Core...")
+        core = LokiCore(config)
+        
+        # Initialize CLI
+        cli = CLIInterface(core)
+        
+        # Register cleanup handler
+        def cleanup_handler():
+            """Cleanup on exit"""
+            try:
+                if core.running:
+                    # Can't use async in atexit, so just set flag
+                    core.running = False
+                
+                log_with_context("info", "System cleanup completed")
+            except Exception as e:
+                print(f"Cleanup error: {e}")
+        
+        atexit.register(cleanup_handler)
+        
+        # Start CLI
+        log_with_context("info", "Starting CLI interface...")
+        await cli.run()
+        
+    except KeyboardInterrupt:
+        log_with_context("info", "Shutdown requested by user")
+    except Exception as e:
+        log_exception("Fatal error in main", e)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Goodbye!")
+    except Exception as e:
+        print(f"💥 Fatal error: {e}")
+        sys.exit(1)
+
+
+# ======================================================================
+# LOKI – APPEND-ONLY SUPER-PATCH (v3.1)
+# Goals coverage: targets/timeframe, capital & profit protection (90% daily
+# allocation + PPM math veto + 90/95% recovery/lock), SL/TSL helpers, safe
+# universe narrowing via selector hook, lifecycle commands (paper/live),
+# idle learning, model hub (load/validate/list/switch), LLM add/update,
+# backtest + run tests, perf timers, Indian broker router stubs, idempotent.
+# Paste at EOF of loki_f1.py (no edits above).
+# ======================================================================
+
+from __future__ import annotations
+import json, csv, math, time as _t, threading, traceback, statistics, uuid, inspect
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# ---------------------------- paths & files ----------------------------
+try:
+    _BASE_DIR  # existing if prior patch ran
+except NameError:
+    _BASE_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path(".").resolve()
+
+_REPORTS   = _BASE_DIR / "reports"; _REPORTS.mkdir(parents=True, exist_ok=True)
+_BT_DIR    = _REPORTS / "backtests"; _BT_DIR.mkdir(parents=True, exist_ok=True)
+_TEST_DIR  = _REPORTS / "test_results"; _TEST_DIR.mkdir(parents=True, exist_ok=True)
+_STATE_DIR = _REPORTS / "models_state"; _STATE_DIR.mkdir(parents=True, exist_ok=True)
+_MODELS_DIR= _BASE_DIR / "models"; _MODELS_DIR.mkdir(parents=True, exist_ok=True)
+_LLMS_DIR  = _BASE_DIR / "llms"; _LLMS_DIR.mkdir(parents=True, exist_ok=True)
+
+_PPM_STATE     = _REPORTS / "ppm_state.json"
+_GOAL_STATE    = _REPORTS / "goal_state.json"
+_PERF_METRICS  = _REPORTS / "perf_metrics.json"
+_MODELS_REG    = _REPORTS / "models_registry.json"
+
+# ------------------------------ logger --------------------------------
+def _plog(level: str, msg: str, **extra):
+    try:
+        log_with_context(level, msg, **extra)  # type: ignore[name-defined]
+    except Exception:
+        payload = " ".join(f"{k}={v}" for k,v in extra.items()) if extra else ""
+        print(f"[{level.upper()}] {msg}{(' ' + payload) if payload else ''}")
+
+# ---------------------------- guard flags -----------------------------
+if "__loki_guard_flags__" not in globals():
+    __loki_guard_flags__ = {
+        "selector_hook": False,
+        "sl_tsl_attached": False,
+        "perf_signal": False,
+        "perf_order": False,
+        "ppm_wrap": False,
+        "idle_learning": False,
+        "cmd_router_bound": False,
+    }
+
+def _safe_json_read(p: Path, default):
+    try:
+        if p.exists(): return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        _plog("warn","json read failed", path=str(p), err=str(e))
+    return default
+
+def _safe_json_write(p: Path, obj):
+    try:
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+        tmp.replace(p)
+        return True
+    except Exception as e:
+        _plog("warn","json write failed", path=str(p), err=str(e))
+        try:
+            if tmp.exists(): tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+# --------------------------- goal & session ---------------------------
+_GOALS = _safe_json_read(_GOAL_STATE, {
+    "initial_investment": None,     # float or None
+    "target_profit": 0.0,           # absolute currency
+    "deadline_ts": None,            # epoch seconds
+    "allocation_fraction": 0.90,    # daily reinvestment fraction
+    "soft_recovery_ratio": 0.90,    # enter recovery when loss >= 90% of profit
+    "hard_lock_ratio": 0.95,        # exit/lock if loss >= 95% of profit
+    "session": {
+        "day_key": None,            # YYYY-MM-DD of last session start
+        "equity_start": None,
+        "allocation_cap": None,
+        "allocation_used": 0.0
+    },
+    "safe_universe": ["NIFTYBEES","HDFCBANK","RELIANCE"]
+})
+
+def _today_key():
+    try:
+        import datetime as _dt
+        return _dt.datetime.utcnow().strftime("%Y-%m-%d")
+    except Exception:
+        return str(int(_t.time()//86400))
+
+def _get_equity(core) -> Optional[float]:
+    try:
+        if hasattr(core, "portfolio") and hasattr(core.portfolio, "equity"):
+            return float(core.portfolio.equity)
+        if hasattr(core, "get_equity") and callable(core.get_equity):
+            return float(core.get_equity())
+        if hasattr(core, "ledger") and hasattr(core.ledger, "equity"):
+            return float(core.ledger.equity)
+    except Exception: pass
+    return None
+
+def _start_session_allocation(core):
+    # (Re)compute daily cap = allocation_fraction * current equity
+    day = _today_key()
+    eq = _get_equity(core)
+    if eq is None:
+        _GOALS["session"].update({"day_key": day, "equity_start": None,
+                                  "allocation_cap": None, "allocation_used": 0.0})
+        _safe_json_write(_GOAL_STATE, _GOALS)
+        _plog("warn","equity unknown; allocation cap disabled for session", day=day)
+        return
+    cap = float(_GOALS["allocation_fraction"]) * float(eq)
+    _GOALS["session"].update({"day_key": day, "equity_start": float(eq),
+                              "allocation_cap": float(cap), "allocation_used": 0.0})
+    _safe_json_write(_GOAL_STATE, _GOALS)
+    _plog("info","session allocation set", day=day, equity_start=eq, cap=cap)
+
+def _ensure_session(core):
+    s = _GOALS.get("session", {})
+    if s.get("day_key") != _today_key():
+        _start_session_allocation(core)
+
+def _consume_allocation(notional: float) -> bool:
+    try:
+        cap = _GOALS["session"].get("allocation_cap")
+        if cap is None: return True  # no cap known
+        used = _GOALS["session"].get("allocation_used", 0.0)
+        if notional <= (cap - used + 1e-9):
+            _GOALS["session"]["allocation_used"] = float(used + notional)
+            _safe_json_write(_GOAL_STATE, _GOALS)
+            return True
+        return False
+    except Exception:
+        return True  # fail-open
+
+# --------------------------- cumulative P/L ---------------------------
+_PPM = _safe_json_read(_PPM_STATE, {
+    "cushion": 0.10,           # 10% cushion (i.e., allow loss up to 90% of cum profit)
+    "cum_profit": 0.0,
+    "cum_loss": 0.0,
+    "last_sync": 0
+})
+
+def _ppm_sync_from_db(core):
+    # Optional: recompute cum P&L from DB (if present)
+    try:
+        dbm = getattr(core, "db_manager", None)
+        if not dbm: return
+        rows = dbm.query_records("SELECT pnl FROM trades WHERE pnl IS NOT NULL;", ())
+        cp = sum(max(0.0, float(r.get("pnl", 0.0))) for r in rows)
+        cl = sum(max(0.0, -float(r.get("pnl", 0.0))) for r in rows)
+        _PPM.update({"cum_profit": float(cp), "cum_loss": float(cl), "last_sync": int(_t.time())})
+        _safe_json_write(_PPM_STATE, _PPM)
+    except Exception:
+        pass
+
+def _ppm_veto_math(potential_loss: float) -> Tuple[bool, str]:
+    """
+    Your rule:
+      Allow trade only if total_loss + potential_loss < total_profit.
+      (Potential loss estimated via ATR-lite stop distance × qty.)
+    Also apply cushion band for protective mode messaging.
+    """
+    cp, cl = float(_PPM["cum_profit"]), float(_PPM["cum_loss"])
+    if (cl + max(0.0, potential_loss)) >= cp and cp > 0.0:
+        return True, f"PPM veto: loss {cl:.2f} + potential {potential_loss:.2f} ≥ profit {cp:.2f}"
+    # soft/hard flags derived for recovery/lock
+    soft = float(_GOALS.get("soft_recovery_ratio", 0.90))
+    hard = float(_GOALS.get("hard_lock_ratio", 0.95))
+    if cp > 0.0 and cl >= soft*cp:
+        # we won't block here (soft) but recovery mode hint is active
+        return False, "recovery_hint"
+    if cp > 0.0 and cl >= hard*cp:
+        return True, f"PPM emergency lock: cum_loss {cl:.2f} ≥ {hard*cp:.2f} (95% profit)"
+    return False, "ok"
+
+def _calc_stop_distance(price: float, hist_df=None) -> float:
+    # ATR-lite; fall back to 2% of price
+    try:
+        if hist_df is not None and len(hist_df) >= 15:
+            import numpy as np
+            h = hist_df["high"].values[-15:]; l = hist_df["low"].values[-15:]; c = hist_df["close"].values[-15:]
+            tr = np.maximum(h[-1]-l[-1], np.maximum(abs(h[-1]-c[-2]), abs(l[-1]-c[-2])))
+            if float(tr) > 0: return float(tr)
+    except Exception: pass
+    return 0.02 * float(price)
+
+def _estimate_potential_loss(price: float, qty: float, hist_df=None) -> float:
+    try:
+        return max(0.0, _calc_stop_distance(price, hist_df) * abs(qty))
+    except Exception:
+        return 0.0
+
+def _fetch_hist_df(core, symbol: str, timeframe="15m", limit=20):
+    try:
+        ex = getattr(core, "exchange", None)
+        if ex and hasattr(ex, "fetch_ohlcv"):
+            return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except Exception as e:
+        _plog("warn","hist fetch failed", sym=symbol, err=str(e))
+    return None
+
+# ---------------------------- selector hook ---------------------------
+_Core = globals().get("LokiCore")
+if _Core and not __loki_guard_flags__["selector_hook"]:
+    if not hasattr(_Core, "_select_candidates"):
+        def _select_candidates(self, symbols: List[str]) -> List[str]:
+            return symbols
+        setattr(_Core, "_select_candidates", _select_candidates)
+    _orig_sel = getattr(_Core, "_select_candidates")
+    if not getattr(_orig_sel, "__loki_recovery__", False):
+        def _wrapped_sel(self, symbols: List[str]) -> List[str]:
+            try:
+                out = _orig_sel(self, symbols)
+                cp, cl = float(_PPM["cum_profit"]), float(_PPM["cum_loss"])
+                soft = float(_GOALS.get("soft_recovery_ratio", 0.90))
+                # recovery if losses ≥ 90% of profit
+                in_recovery = (cp > 0.0 and cl >= soft*cp)
+                safe = None
+                if hasattr(self, "config") and isinstance(getattr(self, "config"), dict):
+                    safe = self.config.get("safe_universe")
+                safe = safe or _GOALS.get("safe_universe") or []
+                if in_recovery and isinstance(out, list) and safe:
+                    narrowed = [s for s in out if s in safe]
+                    return narrowed or out
+                return out
+            except Exception as e:
+                _plog("warn","selector recovery wrap failed", err=str(e))
+                return symbols
+        setattr(_wrapped_sel, "__loki_recovery__", True)
+        setattr(_Core, "_select_candidates", _wrapped_sel)
+    __loki_guard_flags__["selector_hook"] = True
+
+# ------------------------ SL / trailing stop helpers -------------------
+def _attach_sl_tsl():
+    if __loki_guard_flags__["sl_tsl_attached"]:
+        return
+    targets = [globals().get(n) for n in ("OrderManager","ExecutionEngine","Broker","ZerodhaAdapter")]
+    targets = [t for t in targets if t]
+    for T in targets:
+        if not hasattr(T, "place_stop_loss"):
+            def place_stop_loss(self, symbol: str, qty: float, stop_price: float, **kw):
+                try:
+                    for m in ("submit_order","place_order","submit_stop_order"):
+                        if hasattr(self, m):
+                            return getattr(self, m)(symbol=symbol, side=("sell" if qty>0 else "buy"),
+                                                    order_type="stop", stop_price=stop_price,
+                                                    quantity=abs(qty), **kw)
+                    return {"ok": False, "reason": "stop not supported"}
+                except Exception as e:
+                    _plog("warn","place_stop_loss failed", err=str(e))
+                    return {"ok": False, "err": str(e)}
+            setattr(T, "place_stop_loss", place_stop_loss)
+        if not hasattr(T, "attach_trailing_stop"):
+            def attach_trailing_stop(self, symbol: str, qty: float, trail_distance: float, **kw):
+                try:
+                    for m in ("submit_order","place_order","submit_trailing_stop"):
+                        if hasattr(self, m):
+                            return getattr(self, m)(symbol=symbol, side=("sell" if qty>0 else "buy"),
+                                                    order_type="trailing_stop",
+                                                    trail_distance=trail_distance,
+                                                    quantity=abs(qty), **kw)
+                    return {"ok": False, "reason": "trailing stop not supported"}
+                except Exception as e:
+                    _plog("warn","attach_trailing_stop failed", err=str(e))
+                    return {"ok": False, "err": str(e)}
+            setattr(T, "attach_trailing_stop", attach_trailing_stop)
+    # convenience on core
+    if _Core and not hasattr(_Core, "place_stop_loss"):
+        def _core_sl(self, symbol, qty, stop_price, **kw):
+            om = getattr(self, "order_manager", None)
+            if om and hasattr(om, "place_stop_loss"): return om.place_stop_loss(symbol, qty, stop_price, **kw)
+            return {"ok": False, "reason": "no order_manager.stop_loss"}
+        setattr(_Core, "place_stop_loss", _core_sl)
+    if _Core and not hasattr(_Core, "attach_trailing_stop"):
+        def _core_tsl(self, symbol, qty, trail_distance, **kw):
+            om = getattr(self, "order_manager", None)
+            if om and hasattr(om, "attach_trailing_stop"): return om.attach_trailing_stop(symbol, qty, trail_distance, **kw)
+            return {"ok": False, "reason": "no order_manager.trailing_stop"}
+        setattr(_Core, "attach_trailing_stop", _core_tsl)
+    __loki_guard_flags__["sl_tsl_attached"] = True
+
+_attach_sl_tsl()
+
+# ------------------------ order pre-trade enforcement ------------------
+def _guard_and_submit(orig):
+    def _wrapped(self, *args, **kwargs):
+        try:
+            side   = (kwargs.get("side") or (len(args)>1 and args[1]) or "buy").lower()
+            symbol = kwargs.get("symbol") or (len(args)>0 and args[0]) or "UNKNOWN"
+            qty    = float(kwargs.get("quantity") or kwargs.get("qty") or kwargs.get("size") or 0.0)
+            price  = float(kwargs.get("current_price") or kwargs.get("price") or 0.0)
+            core   = getattr(self, "core", None) or globals().get("core")
+
+            if core is not None:
+                _ensure_session(core)
+
+            # 1) emergency lock?
+            cp, cl = float(_PPM["cum_profit"]), float(_PPM["cum_loss"])
+            hard = float(_GOALS.get("hard_lock_ratio", 0.95))
+            if cp > 0.0 and cl >= hard*cp:
+                _plog("warning","PPM emergency lock", cum_profit=cp, cum_loss=cl)
+                return {"status":"rejected", "reason":"emergency_lock", "order_id": None}
+
+            # 2) enforce daily allocation cap
+            notional = abs(qty)*price
+            if not _consume_allocation(notional):
+                _plog("warning","allocation cap exceeded", notional=notional)
+                return {"status":"rejected", "reason":"allocation_cap", "order_id": None}
+
+            # 3) PPM math veto (total_loss + potential_loss < total_profit)
+            hist = _fetch_hist_df(core, symbol)
+            pot_loss = _estimate_potential_loss(price, qty, hist_df=hist)
+            veto, why = _ppm_veto_math(pot_loss)
+            if veto:
+                _plog("warning","PPM veto", reason=why, symbol=symbol, qty=qty, price=price)
+                return {"status":"rejected", "reason":"ppm_veto", "detail": why, "order_id": None}
+
+        except Exception as e:
+            _plog("error","pretrade guard error", err=str(e))
+        return orig(self, *args, **kwargs)
+    return _wrapped
+
+for _clsname in ("OrderManager","ExecutionEngine","Broker","ZerodhaAdapter"):
+    C = globals().get(_clsname)
+    if not C: continue
+    for m in ("submit_market_order","submit_order","place_order"):
+        if hasattr(C, m):
+            fn = getattr(C, m)
+            if not getattr(fn, "__loki_guard__", False):
+                setattr(C, m, _guard_and_submit(fn))
+                setattr(getattr(C, m), "__loki_guard__", True)
+                _plog("info","pretrade guard attached", cls=_clsname, method=m)
+
+# ------------------------------ perf timers ---------------------------
+class _PerfStore:
+    MAX = 500
+    def __init__(self, path: Path):
+        self.path = path
+        try:
+            self.store: Dict[str, List[float]] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:
+            self.store = {}
+    def add(self, key: str, ms: float):
+        arr = self.store.setdefault(key, [])
+        arr.append(float(ms))
+        if len(arr) > self.MAX: self.store[key] = arr[-self.MAX:]
+        _safe_json_write(self.path, self.store)
+    def summary(self):
+        out={}
+        for k, arr in self.store.items():
+            if not arr: out[k]={"count":0,"avg_ms":0.0,"p95_ms":0.0,"max_ms":0.0}; continue
+            try: p95 = statistics.quantiles(arr, n=20)[-1]
+            except Exception: p95 = sorted(arr)[int(0.95*(len(arr)-1))] if len(arr)>1 else arr[0]
+            out[k] = {"count":len(arr),"avg_ms":sum(arr)/len(arr),"p95_ms":float(p95),"max_ms":max(arr)}
+        return out
+
+_PERF = _PerfStore(_PERF_METRICS)
+
+def _now_ms():
+    try: return _t.perf_counter()*1000.0
+    except Exception: return _t.time()*1000.0
+
+if not __loki_guard_flags__["perf_signal"]:
+    try:
+        sg = getattr(globals().get("core"), "signal_gen", None)
+        if sg and hasattr(sg, "generate"):
+            _orig = sg.generate
+            if not getattr(_orig, "__loki_perf__", False):
+                def _wrap(*a, **k):
+                    t0=_now_ms()
+                    try: return _orig(*a, **k)
+                    finally: _PERF.add("signal_generate_ms", _now_ms()-t0)
+                setattr(_wrap,"__loki_perf__",True)
+                setattr(sg,"generate",_wrap)
+                __loki_guard_flags__["perf_signal"]=True
+                _plog("info","perf wrap signal_gen.generate")
+    except Exception as e:
+        _plog("warn","signal perf wrap failed", err=str(e))
+
+if not __loki_guard_flags__["perf_order"]:
+    for _clsname in ("OrderManager","ExecutionEngine","Broker","ZerodhaAdapter"):
+        C = globals().get(_clsname)
+        if not C: continue
+        for m in ("submit_market_order","submit_order","place_order"):
+            if hasattr(C, m):
+                fn = getattr(C, m)
+                if getattr(fn, "__loki_perf__", False): continue
+                def _wrap(self, *a, __orig=fn, **k):
+                    t0=_now_ms()
+                    try: return __orig(self, *a, **k)
+                    finally: _PERF.add("order_submit_ms", _now_ms()-t0)
+                setattr(_wrap,"__loki_perf__",True)
+                setattr(C, m, _wrap)
+    __loki_guard_flags__["perf_order"]=True
+    _plog("info","perf wrap order submits")
+
+# --------------------------- idle learning loop -----------------------
+_idle_stop = threading.Event()
+def _idle_loop():
+    _plog("info","idle learning loop started")
+    while not _idle_stop.is_set():
+        try:
+            learner = globals().get("StrategyLearner") or globals().get("ModelTrainer")
+            c = globals().get("core")
+            if learner and hasattr(learner,"learn"):
+                try: learner.learn(c)
+                except Exception as e: _plog("warn","idle learn step failed", err=str(e))
+        except Exception as e:
+            _plog("warn","idle loop error", err=str(e))
+        _idle_stop.wait(30.0)
+    _plog("info","idle learning loop stopped")
+
+if not __loki_guard_flags__["idle_learning"]:
+    try:
+        t = threading.Thread(target=_idle_loop, daemon=True, name="LokiIdleLearn")
+        t.start()
+        __loki_guard_flags__["idle_learning"]=True
+    except Exception as e:
+        _plog("warn","idle learning not started", err=str(e))
+
+# ----------------------------- backtesting ----------------------------
+def _bt_run(core, symbol: str, timeframe: str="1h", days: int=60, fee_bps: float=1.0) -> Dict[str, Any]:
+    try:
+        import pandas as pd, numpy as np
+        ex = getattr(core, "exchange", None)
+        if not ex or not hasattr(ex,"fetch_ohlcv"):
+            return {"ok": False, "err": "exchange.fetch_ohlcv not available"}
+        hours = 24 if timeframe.endswith("h") else 1
+        limit = max(120, int(days*hours)+20)
+        df = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        if df is None or getattr(df, "empty", True): return {"ok": False, "err": "no data"}
+        df = df.tail(limit)
+
+        cash, qty, wins, losses, trades = 10000.0, 0.0, 0, 0, 0
+        eq_curve=[]; last_buy=None
+        for ts, row in df.iterrows():
+            price = float(row["close"])
+            try: tsn = float(pd.Timestamp(ts).timestamp())
+            except Exception: tsn = eq_curve[-1][0]+60 if eq_curve else 0.0
+            eq_curve.append((tsn, cash + qty*price))
+
+            sig=None
+            if hasattr(core, "signal_gen") and hasattr(core.signal_gen, "generate"):
+                try: sig = core.signal_gen.generate(symbol, df.loc[:ts].tail(256))
+                except Exception: sig = None
+            action=(sig or {}).get("action","hold")
+
+            size = 0.0
+            if hasattr(core,"risk") and hasattr(core.risk,"atr_position_size"):
+                try: size=float(core.risk.atr_position_size(df.loc[:ts].tail(256), price))
+                except Exception: size=0.0
+
+            if action=="buy" and qty<=0 and size>0:
+                notional=size*price; fee=notional*(fee_bps/1e4)
+                if cash>=notional+fee:
+                    cash-= (notional+fee); qty+=size; trades+=1; last_buy=price
+            elif action=="sell" and qty>0:
+                notional=qty*price; fee=notional*(fee_bps/1e4)
+                pnl=(price-(last_buy or price))*qty - fee
+                cash+= (notional - fee); trades+=1; qty=0.0
+                if pnl>=0: wins+=1
+                else: losses+=1
+
+        if qty>0:
+            price=float(df["close"].iloc[-1])
+            notional=qty*price; fee=notional*(fee_bps/1e4)
+            pnl=(price-(last_buy or price))*qty - fee
+            cash+= (notional - fee); trades+=1; qty=0.0
+            if pnl>=0: wins+=1
+            else: losses+=1
+            eq_curve.append((eq_curve[-1][0], cash) if eq_curve else (0.0, cash))
+
+        eq = np.array([e for _,e in eq_curve], float)
+        rets = np.diff(eq)/(eq[:-1]+1e-12)
+        if rets.size==0:
+            metrics={"sharpe":0.0,"sortino":0.0,"mdd":0.0,"cagr":0.0}
+        else:
+            ann=252*24
+            sharpe=(rets.mean()/(rets.std(ddof=1)+1e-12))*math.sqrt(ann)
+            downside=np.std(np.clip(rets,None,0.0), ddof=1)
+            sortino=(rets.mean()/(downside+1e-12))*math.sqrt(ann)
+            roll=np.maximum.accumulate(eq); mdd=float(np.max((roll-eq)/(roll+1e-12)))
+            years=max(1e-9,(eq_curve[-1][0]-eq_curve[0][0])/(365*24*3600))
+            cagr=float((eq[-1]/max(eq[0],1e-12))**(1.0/years)-1.0)
+            metrics={"sharpe":float(sharpe),"sortino":float(sortino),"mdd":mdd,"cagr":cagr}
+        return {"ok": True, "symbol": symbol, "timeframe": timeframe, "days": days,
+                "trades":trades,"wins":wins,"losses":losses,"pnl":float(eq[-1]-eq[0]),
+                "metrics":metrics, "equity_curve": eq_curve[-500:]}
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
+
+def _bt_write(rep: Dict[str,Any]):
+    if not rep.get("ok"): return
+    sym=(rep.get("symbol") or "UNKNOWN").replace("/","_")
+    tf = rep.get("timeframe") or "1h"
+    stub=f"{sym}_{tf}_{int(_t.time())}"
+    _safe_json_write(_BT_DIR/(stub+".json"), {k:v for k,v in rep.items() if k!="equity_curve"})
+    try:
+        if rep.get("equity_curve"):
+            with open(_BT_DIR/f"{stub}_equity.csv","w",newline="",encoding="utf-8") as f:
+                w=csv.writer(f); w.writerow(["ts","equity"])
+                for ts,eq in rep["equity_curve"]: w.writerow([int(ts), float(eq)])
+    except Exception as e:
+        _plog("warn","bt csv write failed", err=str(e))
+    print(f"[BT] Report: {(_BT_DIR/(stub+'.json'))}")
+
+# ----------------------- simple model validation ----------------------
+def _validate_on_series(prices: List[float], acts: List[str]) -> Dict[str,float]:
+    try:
+        if len(prices)<3 or len(acts)<2: return {"signals": float(len(acts)),"accuracy":0.0,"coverage":0.0}
+        correct=acted=0
+        for i in range(len(acts)-1):
+            s=acts[i]
+            if s not in ("buy","sell"): continue
+            acted+=1
+            fwd=prices[i+1]-prices[i]
+            if (s=="buy" and fwd>0) or (s=="sell" and fwd<0): correct+=1
+        return {"signals":float(len(acts)),"accuracy": (correct/acted) if acted else 0.0, "coverage": (acted/max(1,len(acts)))}
+    except Exception: return {"signals":float(len(acts or [])),"accuracy":0.0,"coverage":0.0}
+
+def validate_model(core, symbol="NIFTYBEES", timeframe="1h", days=30):
+    try:
+        import pandas as pd
+        ex=getattr(core,"exchange",None)
+        if not ex or not hasattr(ex,"fetch_ohlcv"): return {"ok": False,"err":"no exchange"}
+        hours=24 if timeframe.endswith("h") else 1
+        df=ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=max(120,int(days*hours)+20))
+        if df is None or getattr(df,"empty",True): return {"ok":False,"err":"no data"}
+        prices=[]; acts=[]
+        for ts,row in df.iterrows():
+            price=float(row["close"]); prices.append(price)
+            sig=None
+            if hasattr(core,"signal_gen") and hasattr(core.signal_gen,"generate"):
+                try: sig=core.signal_gen.generate(symbol, df.loc[:ts].tail(256))
+                except Exception as e: _plog("warn","validation step failed", err=str(e))
+            acts.append((sig or {}).get("action","hold"))
+        m=_validate_on_series(prices, acts)
+        print(f"[VALIDATION] {symbol} {timeframe} {days}d -> accuracy={m['accuracy']:.2%} coverage={m['coverage']:.2%}")
+        return {"ok":True,"symbol":symbol,"timeframe":timeframe,"days":days, **m}
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
+
+# ------------------------------ ModelHub ------------------------------
+import importlib, importlib.util
+class _ModelHub:
+    def __init__(self): self.models: Dict[str,Dict[str,Any]]={}
+    def _imp(self, name): 
+        try: return importlib.import_module(name)
+        except Exception: return None
+    def _load_sklearn(self, p: Path):
+        jb=self._imp("joblib"); 
+        if not jb: raise RuntimeError("joblib not available")
+        return jb.load(str(p)), "sklearn"
+    def _load_torch(self, p: Path):
+        th=self._imp("torch"); 
+        if not th: raise RuntimeError("torch not available")
+        m=th.jit.load(str(p)) if p.suffix.lower() in (".pt",".pth") else th.load(str(p), map_location="cpu")
+        return m, "torch"
+    def _load_onnx(self, p: Path):
+        ort=self._imp("onnxruntime");
+        if not ort: raise RuntimeError("onnxruntime not available")
+        sess=ort.InferenceSession(str(p), providers=["CPUExecutionProvider"])
+        return sess, "onnx"
+    def load(self, path: str, name: Optional[str]=None):
+        p=Path(path); assert p.exists(), f"model file not found: {path}"
+        suf=p.suffix.lower()
+        if suf in (".pkl",".joblib"): m,typ=self._load_sklearn(p)
+        elif suf in (".pt",".pth"):    m,typ=self._load_torch(p)
+        elif suf==".onnx":             m,typ=self._load_onnx(p)
+        else: raise RuntimeError(f"unsupported model type: {suf}")
+        nm=name or p.stem
+        self.models[nm]={"model":m,"type":typ,"loaded":int(_t.time()),"active_preferred":False}
+        try:
+            c=globals().get("core")
+            if c and getattr(c,"signal_generator",None) and hasattr(c.signal_generator,"add_model"):
+                c.signal_generator.add_model(nm, m, typ)
+        except Exception: pass
+        print(f"[MODEL] loaded: {nm} ({typ})"); return {"ok":True,"name":nm,"type":typ}
+    def validate(self, path: str):
+        p=Path(path); rep={"path":str(p),"ok":False,"type":None,"detail":""}
+        try:
+            info=self.load(str(p), name=f"__tmp__{uuid.uuid4().hex[:6]}")
+            typ=self.models[info["name"]]["type"]; rep["type"]=typ
+            import numpy as np; dummy=np.zeros((1,60), dtype=np.float32)
+            if typ=="sklearn":
+                m=self.models[info["name"]]["model"]
+                _ = m.predict_proba(dummy) if hasattr(m,"predict_proba") else m.predict(dummy)
+            elif typ=="torch":
+                th=self._imp("torch"); t=th.tensor(dummy); _ = self.models[info["name"]]["model"](t)
+            elif typ=="onnx":
+                sess=self.models[info["name"]]["model"]; _ = sess.run(None, {sess.get_inputs()[0].name: dummy})
+            rep.update(ok=True, detail="dummy inference ok (1x60)")
+        except Exception as e:
+            rep["detail"]=f"validation failed: {e}"
+        print(f"[MODEL] validate: {json.dumps(rep, default=str)}"); return rep
+    def switch(self, name: str):
+        if name not in self.models: return {"ok":False, "err":"unknown model"}
+        for k in self.models: self.models[k]["active_preferred"]=False
+        self.models[name]["active_preferred"]=True
+        print(f"[MODEL] active_preferred={name}"); return {"ok":True,"active":name}
+    def list(self):
+        out={k:{kk:vv for kk,vv in v.items() if kk!="model"} for k,v in self.models.items()}
+        print(json.dumps(out, indent=2, default=str)); return out
+
+_MODEL_HUB = _ModelHub()
+
+# ----------------------- Indian broker router (stubs) -----------------
+class _BaseINBroker:
+    name="base"
+    def __init__(self, config: dict): self.config=config or {}
+    async def fetch_ohlcv(self, symbol:str, timeframe:str="1h", limit:int=256): raise NotImplementedError
+    async def get_ticker(self, symbol:str): raise NotImplementedError
+    def submit_market_order(self, symbol:str, side:str, quantity:float, current_price:float, strategy:str="core"): raise NotImplementedError
+
+class ZerodhaBroker(_BaseINBroker): name="zerodha"
+class AngelBroker(_BaseINBroker):    name="angel"
+class FivePaisaBroker(_BaseINBroker):name="5paisa"
+
+class BrokerRouter:
+    def __init__(self, core_ref):
+        self.core=core_ref
+        b=(getattr(core_ref,"config",{}) or {}).get("broker",{})
+        self.kind=(b or {}).get("type","").lower()
+        self.adapter=None
+        if self.kind=="zerodha": self.adapter=ZerodhaBroker(b)
+        elif self.kind=="angel": self.adapter=AngelBroker(b)
+        elif self.kind in ("5paisa","fivepaisa"): self.adapter=FivePaisaBroker(b)
+    def enabled(self)->bool: return self.adapter is not None
+    # dual async/sync helpers
+    def _dual(self, obj, meth, *a, **k):
+        fn=getattr(obj, meth, None)
+        if fn is None: raise AttributeError(meth)
+        if inspect.iscoroutinefunction(fn): return fn(*a, **k)
+        class _Immediate:
+            def __await__(self): yield; return fn(*a, **k)
+        return _Immediate()
+    async def fetch_ohlcv(self, symbol:str, timeframe="1h", limit=256):
+        if not self.enabled(): return await self._dual(self.core.exchange, "fetch_ohlcv", symbol, timeframe, limit=limit)
+        try: return await self._dual(self.adapter, "fetch_ohlcv", symbol, timeframe, limit=limit)
+        except NotImplementedError: return await self._dual(self.core.exchange, "fetch_ohlcv", symbol, timeframe, limit=limit)
+    async def get_ticker(self, symbol:str):
+        if not self.enabled(): return await self._dual(self.core.exchange, "get_ticker", symbol)
+        try: return await self._dual(self.adapter, "get_ticker", symbol)
+        except NotImplementedError: return await self._dual(self.core.exchange, "get_ticker", symbol)
+    def submit_market_order(self, symbol:str, side:str, quantity:float, current_price:float, strategy="core"):
+        if not self.enabled(): return self.core.order_manager.submit_market_order(symbol, side, quantity, current_price, strategy=strategy)
+        try: return self.adapter.submit_market_order(symbol, side, quantity, current_price, strategy=strategy)
+        except NotImplementedError: return self.core.order_manager.submit_market_order(symbol, side, quantity, current_price, strategy=strategy)
+
+try:
+    c=globals().get("core")
+    if c and not hasattr(c,"in_broker"):
+        c.in_broker=BrokerRouter(c)
+        _plog("info","IN broker router attached", kind=getattr(c.in_broker,"kind",""))
+except Exception: pass
+
+# ------------------------------ tests runner --------------------------
+def _run_all_tests():
+    try:
+        import unittest, io
+        from contextlib import redirect_stdout, redirect_stderr
+        td = _BASE_DIR / "test_units"; td.mkdir(parents=True, exist_ok=True)
+        suite = unittest.defaultTestLoader.discover(start_dir=str(td), pattern="test_*.py")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            res = unittest.TextTestRunner(stream=out, verbosity=2, buffer=True).run(suite)
+        summ={"run":res.testsRun,"failures":len(res.failures),"errors":len(res.errors),
+              "skipped":len(res.skipped),"success":res.wasSuccessful(),"ts":int(_t.time())}
+        _safe_json_write(_TEST_DIR/"summary.json", summ)
+        print(out.getvalue()); print(f"[TEST] Summary: {summ}")
+        return {"ok": True, **summ}
+    except Exception as e:
+        print("[TEST] error:", e); return {"ok": False, "err": str(e)}
+
+# ------------------------------ CLI router ----------------------------
+try:
+    _ORIG_CMD_ROUTER = globals().get("cmd_router")
+except Exception:
+    _ORIG_CMD_ROUTER = None
+
+def _show_help_ext():
+    print("""
+[LOKI v3.1 Commands]
+  # Goals & capital
+  set investment <amount>
+  set target <profit> <days>
+  set timeframe <days>
+  start session allocation
+  ppm status | ppm cushion <0..1> | ppm reset-period
+  show perf
+  # Lifecycle
+  start_trading | stop_trading
+  start_live_trading | stop_live_trading
+  # Models & validation
+  model load <path> [name] | model validate <path> | model list | model switch <name>
+  validate model [SYMBOL] [TF] [DAYS]
+  # Backtest & tests
+  backtest <SYMBOL> <TF> <DAYS> [FEE_BPS]
+  run tests
+""".strip())
+
+def cmd_router(core, line: str):
+    l=(line or "").strip()
+    if not l: return
+    parts=l.split()
+    cmd=parts[0].lower()
+
+    # Help
+    if cmd in ("help","h","?"):
+        _show_help_ext()
+        if _ORIG_CMD_ROUTER and _ORIG_CMD_ROUTER is not cmd_router:
+            try: _ORIG_CMD_ROUTER(core, line)
+            except Exception as e: _plog("warn","orig help failed", err=str(e))
+        return
+
+    # Goals & capital
+    if cmd=="set" and len(parts)>=3 and parts[1].lower()=="investment":
+        try:
+            amt=float(parts[2]); _GOALS["initial_investment"]=amt; _safe_json_write(_GOAL_STATE,_GOALS)
+            print(f"Initial investment set: {amt}")
+        except Exception as e:
+            print("usage: set investment <amount> (error:", e, ")")
+        return
+
+    if cmd=="set" and len(parts)>=3 and parts[1].lower()=="target":
+        try:
+            profit=float(parts[2]); days=int(parts[3]) if len(parts)>=4 else 30
+            _GOALS["target_profit"]=profit; _GOALS["deadline_ts"]=int(_t.time()+days*86400)
+            _safe_json_write(_GOAL_STATE,_GOALS)
+            print(f"Target set: profit={profit}, deadline={_GOALS['deadline_ts']}")
+        except Exception as e:
+            print("usage: set target <profit> <days> (error:", e, ")")
+        return
+
+    if cmd=="set" and len(parts)>=3 and parts[1].lower()=="timeframe":
+        try:
+            days=int(parts[2]); _GOALS["deadline_ts"]=int(_t.time()+days*86400); _safe_json_write(_GOAL_STATE,_GOALS)
+            print(f"Deadline updated: {_GOALS['deadline_ts']}")
+        except Exception as e:
+            print("usage: set timeframe <days> (error:", e, ")")
+        return
+
+    if l.lower()=="start session allocation":
+        _start_session_allocation(core); return
+
+    # PPM
+    if cmd=="ppm":
+        if len(parts)>=2 and parts[1]=="status":
+            _ppm_sync_from_db(core)
+            print(f"[PPM] cum_profit={_PPM['cum_profit']:.2f} cum_loss={_PPM['cum_loss']:.2f} cushion={_PPM.get('cushion',0.10):.2%}")
+            return
+        if len(parts)>=3 and parts[1]=="cushion":
+            try:
+                v=float(parts[2]); v=max(0.0, min(1.0, v)); _PPM["cushion"]=v; _safe_json_write(_PPM_STATE,_PPM)
+                print(f"[PPM] cushion set to {v:.2%}")
+            except Exception as e:
+                print("[PPM] invalid cushion:", e)
+            return
+        if len(parts)>=2 and parts[1]=="reset-period":
+            _PPM.update({"cum_profit":0.0,"cum_loss":0.0}); _safe_json_write(_PPM_STATE,_PPM)
+            print("[PPM] local state reset"); return
+        print("Usage: ppm status | ppm cushion <0..1> | ppm reset-period"); return
+
+    # Lifecycle commands (best-effort into your core)
+    if l.lower()=="start_trading":
+        try:
+            if hasattr(core,"start_paper_trading"): core.start_paper_trading(); print("Paper trading started.")
+            elif hasattr(core,"start") and callable(core.start): core.start(mode="paper"); print("Paper trading started.")
+            else: print("No paper-start hook available (start_paper_trading/start).")
+        except Exception as e: print("start_trading failed:", e)
+        return
+
+    if l.lower()=="stop_trading":
+        try:
+            if hasattr(core,"stop_paper_trading"): core.stop_paper_trading(); print("Paper trading stopped.")
+            elif hasattr(core,"stop") and callable(core.stop): core.stop(); print("Trading stopped.")
+            else: print("No paper-stop hook available (stop_paper_trading/stop).")
+        except Exception as e: print("stop_trading failed:", e)
+        return
+
+    if l.lower()=="start_live_trading":
+        try:
+            if hasattr(core,"start_live_trading"): core.start_live_trading(); print("Live trading started.")
+            elif hasattr(core,"start") and callable(core.start): core.start(mode="live"); print("Live trading started.")
+            else: print("No live-start hook available (start_live_trading/start).")
+        except Exception as e: print("start_live_trading failed:", e)
+        return
+
+    if l.lower()=="stop_live_trading":
+        try:
+            if hasattr(core,"stop_live_trading"): core.stop_live_trading(); print("Live trading stopped.")
+            elif hasattr(core,"stop") and callable(core.stop): core.stop(); print("Trading stopped.")
+            else: print("No live-stop hook available (stop_live_trading/stop).")
+        except Exception as e: print("stop_live_trading failed:", e)
+        return
+
+    # Models
+    if cmd=="model":
+        if len(parts)>=3 and parts[1]=="load":
+            name = parts[3] if len(parts)>=4 else None
+            _MODEL_HUB.load(parts[2], name=name); return
+        if len(parts)>=3 and parts[1]=="validate":
+            _MODEL_HUB.validate(parts[2]); return
+        if len(parts)>=2 and parts[1]=="list":
+            _MODEL_HUB.list(); return
+        if len(parts)>=3 and parts[1]=="switch":
+            _MODEL_HUB.switch(" ".join(parts[2:])); return
+        print("Usage: model load|validate|list|switch"); return
+
+    # Validation
+    if cmd=="validate" and len(parts)>=2 and parts[1].lower()=="model":
+        try:
+            sym = parts[2] if len(parts)>=3 else "NIFTYBEES"
+            tf  = parts[3] if len(parts)>=4 else "1h"
+            d   = int(parts[4]) if len(parts)>=5 else 30
+        except Exception as e:
+            print("usage: validate model [SYMBOL] [TF] [DAYS] (error:", e, ")"); return
+        rep=validate_model(core, sym, tf, d)
+        if not rep.get("ok"): print("[VALIDATION] failed:", rep.get("err"))
+        return
+
+    # Perf
+    if cmd=="show" and len(parts)>=2 and parts[1].lower()=="perf":
+        summ=_PERF.summary()
+        if not summ: print("No performance data yet."); return
+        print("[PERF] summary:")
+        for k,v in summ.items():
+            print(f" - {k}: count={int(v['count'])} avg={v['avg_ms']:.2f}ms p95={v['p95_ms']:.2f}ms max={v['max_ms']:.2f}ms")
+        return
+
+    # Backtest
+    if cmd=="backtest" and len(parts)>=4:
+        sym, tf = parts[1], parts[2]
+        try:
+            days=int(parts[3]); fee=float(parts[4]) if len(parts)>=5 else 1.0
+        except Exception as e:
+            print("Invalid params:", e); return
+        rep=_bt_run(core, sym, tf, days, fee)
+        if rep.get("ok"):
+            _bt_write(rep); m=rep.get("metrics",{})
+            print(f"[BT] {rep['trades']} trades | PnL {rep['pnl']:.2f} | Sharpe {m.get('sharpe',0):.2f} | MDD {m.get('mdd',0):.1%}")
+        else:
+            print("[BT] failed:", rep.get("err"))
+        return
+
+    # Tests
+    if cmd=="run" and len(parts)>=2 and parts[1] in ("tests","test"):
+        _run_all_tests(); return
+
+    # Chain to previous router if any
+    if _ORIG_CMD_ROUTER and _ORIG_CMD_ROUTER is not cmd_router:
+        try: _ORIG_CMD_ROUTER(core, line); return
+        except Exception as e: _plog("warn","orig router failed", err=str(e))
+    else:
+        print("Unknown command. Type 'help' for available commands.")
+
+# bind as top router (append-only)
+globals()["cmd_router"] = cmd_router
+__loki_guard_flags__["cmd_router_bound"]=True
+
+# ------------------------------- banner -------------------------------
+def _init_banner():
+    try:
+        print(f"""
+[LOKI SUPER-PATCH v3.1] Loaded
+ - Daily allocation cap: {int(_GOALS.get('allocation_fraction',0.90)*100)}%
+ - PPM math veto active; recovery @ {int(_GOALS.get('soft_recovery_ratio',0.90)*100)}%, lock @ {int(_GOALS.get('hard_lock_ratio',0.95)*100)}%
+ - SL/TSL helpers attached; selector recovery narrowing bridged
+ - ModelHub + validation; backtest; tests; perf timers; lifecycle cmds
+ - State files: { _GOAL_STATE.name }, { _PPM_STATE.name }, { _PERF_METRICS.name }
+Type 'help' to see commands.
+""".strip())
+    except Exception:
+        pass
+
+_init_banner()
+# ======================================================================
+# End of append-only SUPER-PATCH (v3.1)
+# ======================================================================
+
+
+
+
+
+
+
+
